@@ -105,7 +105,7 @@ class WindowsEnvironment(Environment):
         self._window_wait_cancel.set()
 
     def _wait_for_desktop_window(self, target, *, dispatched):
-        from ..desktop_readiness import wait_for_window
+        from ..desktop.desktop_readiness import wait_for_window
         self._pending_window = target
         report = wait_for_window(target, timeout_s=self.window_timeout_s,
             emit=self._window_wait_emit, remaining=self._window_wait_remaining,
@@ -123,13 +123,13 @@ class WindowsEnvironment(Environment):
     # ---- 观察 ----
     def _take_screenshot(self):
         """Desktop fallback; browser screenshots are collected atomically with AX."""
-        from ..desktop_capture import capture_virtual_desktop
+        from ..desktop.desktop_capture import capture_virtual_desktop
         self._desktop_capture = {}
         shot, self._desktop_capture = capture_virtual_desktop()
         return shot
 
     def _runtime_state(self):
-        from ..desktop_state import windows_runtime_state
+        from ..desktop.desktop_state import windows_runtime_state
         return windows_runtime_state()
 
     def _focus_is_browser(self) -> bool:
@@ -137,7 +137,7 @@ class WindowsEnvironment(Environment):
 
         用户可同时用电脑（切到别的窗口），智能体照常通过 CDP 虚拟控制浏览器。
         """
-        from ..utils import list_cdp_pages
+        from ..browser.utils import list_cdp_pages
         try:
             pages = list_cdp_pages("localhost", self.browser_port)
             return any(p.get("url") and not p.get("url", "").startswith(
@@ -152,7 +152,7 @@ class WindowsEnvironment(Environment):
         这样智能体操作浏览器时，你可以照常用自己的鼠标键盘。
         """
         if self._browser_session is None:
-            from ..browser_session import BrowserSession, BrowserOptions
+            from ..browser.browser_session import BrowserSession, BrowserOptions
             self._browser_session = BrowserSession(
                 options=BrowserOptions(endpoint=f"http://localhost:{self.browser_port}",
                                        require_focus=False, session_mode=self.browser_session_mode),
@@ -182,9 +182,9 @@ class WindowsEnvironment(Environment):
         截图仍是该浏览器页面的完整内容，不受遮挡/前台影响。
         """
         from ..model.grounding import screenshot_size
-        from ..scene import Scene, browser_scene
+        from ..runtime.scene import Scene, browser_scene
 
-        from ..desktop_readiness import foreground, window_identity
+        from ..desktop.desktop_readiness import foreground, window_identity
         desktop_before = self._runtime_state() if self._observation_surface == 'desktop' else None
         screenshot, snapshot, metadata = None, None, {}
         error = ""
@@ -261,7 +261,7 @@ class WindowsEnvironment(Environment):
 
     def _derive_scene(self, snapshot, screenshot=None):
         """Derive browser mode from whether page content is actionable in AX."""
-        from ..scene import Scene, browser_scene
+        from ..runtime.scene import Scene, browser_scene
         if snapshot:
             return browser_scene(snapshot, screenshot).to_dict()
         if self._focus_is_browser():
@@ -288,7 +288,7 @@ class WindowsEnvironment(Environment):
         if obs is None or action.action not in self._BROWSER_CDP_ACTIONS:
             return None
         # Route against the actual observation, not a fresh CDP page guess.
-        from ..scene import observation_scene
+        from ..runtime.scene import observation_scene
         if not observation_scene(obs).get("browser_use"):
             return None
         session = self._get_browser_session()
@@ -467,7 +467,7 @@ class WindowsEnvironment(Environment):
     def _step_desktop(self, action: Action) -> StepResult:
         name = action.action
         if name == 'switch_applications':
-            from ..desktop_state import switch_windows_application, windows_application_process
+            from ..desktop.desktop_state import switch_windows_application, windows_application_process
             process = windows_application_process(action.args.get('app_code'))
             if sys.platform == 'win32' and process:
                 self._pending_window = {'process_name': process + '.exe'}
@@ -478,8 +478,8 @@ class WindowsEnvironment(Environment):
                 if result['framework_wait']['status'] == 'completed':
                     result.pop('error_code', None)
             return StepResult(observation=self.observe(), info=result)
-        from ..desktop_readiness import launch_target, global_shortcut, check_keyboard_focus, DesktopFocusError
-        from ..desktop_state import windows_runtime_state
+        from ..desktop.desktop_readiness import launch_target, global_shortcut, check_keyboard_focus, DesktopFocusError
+        from ..desktop.desktop_state import windows_runtime_state
         target = launch_target(action) if sys.platform == 'win32' else None
         if target and self._window_launch_inflight and self._pending_window and self._pending_window.get('process_name') == target['process_name']:
             # A previous launch may still be completing. Never create more windows.
@@ -502,7 +502,7 @@ class WindowsEnvironment(Environment):
             if sys.platform == 'win32' and not self._desktop_capture and name != 'wait':
                 raise ValueError('缺少有效虚拟桌面截图，请重新 observe_desktop')
             if self._desktop_capture:
-                from ..desktop_capture import validate_desktop_action, virtual_geometry
+                from ..desktop.desktop_capture import validate_desktop_action, virtual_geometry
                 mapped, origin = validate_desktop_action(action, self._desktop_capture, virtual_geometry())
                 cmd = to_pyautogui(mapped, desktop_origin=origin, keyboard_guard=keyboard_guard)
             else:
@@ -512,7 +512,7 @@ class WindowsEnvironment(Environment):
                 'channel': 'desktop', 'error_code': 'desktop_geometry_changed', 'error': str(exc)})
         if cmd:
             try:
-                from ..desktop_capture import physical_dpi_context
+                from ..desktop.desktop_capture import physical_dpi_context
                 with physical_dpi_context():
                     exec(cmd, {"__name__": "__main__", "desktop_input_guard": guard_input})  # noqa: S102
             except DesktopFocusError as exc:

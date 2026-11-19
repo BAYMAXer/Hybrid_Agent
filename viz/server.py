@@ -3,9 +3,9 @@
 适配新框架（osworld_agent）：
 - 核心端点 /log /history /ws /run/* /runs /tasks 保留，契约与原 Agent-S3 viz 一致；
 - /experiments/* 和 /debug/* 是原框架的进阶功能，这里做最小 stub，避免前端报错；
-- /run/start 启动的是新框架的 osworld_agent.viz.runner（跑 VMware 真实任务）。
+- /run/start 启动本包的 viz.runner（跑 VMware 真实任务）。
 
-运行：python -m osworld_agent.viz.server
+运行：python -m hybrid_agent.viz.server
 """
 from __future__ import annotations
 
@@ -55,19 +55,19 @@ app.include_router(knowledge_router)
 
 @app.get('/browser/session')
 async def get_browser_session_settings():
-    from osworld_agent.persistent_chrome import browser_settings
+    from ..persistent_chrome import browser_settings
     return {'ok': True, **browser_settings()}
 
 
 @app.post('/browser/session')
 async def set_browser_session_settings(request: Request):
     from fastapi import HTTPException
-    from osworld_agent.persistent_chrome import save_browser_settings
+    from ..persistent_chrome import save_browser_settings
     try:
         value = await request.json()
         if not isinstance(value, dict):
             raise ValueError('浏览器设置必须为对象')
-        from osworld_agent.persistent_chrome import browser_settings
+        from ..persistent_chrome import browser_settings
         saved = browser_settings()
         mode = value.get('browser_session_mode', 'persistent')
         profile = value.get('browser_profile_dir', saved['browser_profile_dir'])
@@ -79,8 +79,9 @@ async def set_browser_session_settings(request: Request):
     return {'ok': True, **settings}
 
 # ---- 配置（环境变量覆盖）----
-_PKG = Path(__file__).resolve().parent.parent          # osworld_agent 包目录
-_PROJECT_ROOT = _PKG.parent                            # 项目根（含 osworld_agent 与 AgentS）
+_PACKAGE_NAME = __package__.rsplit('.', 1)[0]
+_PKG = Path(__file__).resolve().parent.parent
+_PROJECT_ROOT = _PKG.parent
 AGENT_ROOT = os.getenv("OSWORLD_AGENT_ROOT", str(_PROJECT_ROOT))  # 跑 runner 的 cwd
 EXAMPLES_DIR = os.getenv("OSWORLD_EXAMPLES_DIR", "")
 DESKTOP_ENV_PATH = os.getenv("OSWORLD_DESKTOP_ENV_PATH", "")
@@ -501,7 +502,7 @@ def _events_path_for(traj_path, directory, prefix):
 
 def _run_token_usage(events_path):
     """One canonical event stream; missing usage remains explicitly partial."""
-    from ..run_metrics import summarize_events
+    from ..runtime.run_metrics import summarize_events
     if not events_path or not os.path.isfile(events_path):
         return summarize_events([])
     stat = os.stat(events_path)
@@ -655,7 +656,7 @@ async def local_runs():
 
 def _local_run_files():
     """Read new per-run logs and legacy flat workspace logs without moving files."""
-    from osworld_agent.workspace_config import default_workspace_root
+    from ..runtime.workspace_config import default_workspace_root
     root = Path(default_workspace_root())
     if root.is_dir():
         for day in root.iterdir():
@@ -831,7 +832,7 @@ def _read_local_traj(run):
     if traj_path.name.endswith('.jsonl'):
         summary = _local_run_summary_from_events(traj_path)
         from .workbench import project_event_workbench
-        from ..training_events import read_events
+        from ..training.training_events import read_events
         metrics = _local_metrics(traj_path, directory, prefix)
         try:
             workbench = project_event_workbench(read_events(traj_path), summary['instruction'], metrics)
@@ -1035,7 +1036,7 @@ async def test_connection(request: Request):
     import secrets
     import requests as req
     from PIL import Image, ImageDraw
-    from osworld_agent.config import resolve_secret
+    from ..config import resolve_secret
     try:
         cfg = await request.json()
     except Exception:
@@ -1091,7 +1092,7 @@ def _start_local(cfg: dict, viz_port: int | None = None):
     ground_url = cfg.get("ground_url", "http://7.246.80.189:8001/v1")
     ground_api_key = cfg.get("ground_api_key") or "EMPTY"
     max_steps = int(cfg.get("max_steps", 40))
-    from osworld_agent.persistent_chrome import browser_settings, save_browser_settings
+    from ..persistent_chrome import browser_settings, save_browser_settings
     saved_browser = browser_settings()
     session_mode = cfg.get('browser_session_mode', saved_browser['browser_session_mode'])
     profile_dir = cfg.get('browser_profile_dir', saved_browser['browser_profile_dir']) or ''
@@ -1102,16 +1103,16 @@ def _start_local(cfg: dict, viz_port: int | None = None):
     except ValueError as exc:
         return {'ok': False, 'error': str(exc)}
     try:
-        from osworld_agent.workspace_config import default_workspace_root, normalize_workspace_root
+        from ..runtime.workspace_config import default_workspace_root, normalize_workspace_root
         workspace = normalize_workspace_root(cfg.get('workspace_dir') or default_workspace_root())
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
-    from osworld_agent.workspace_config import allocate_local_result_dir
+    from ..runtime.workspace_config import allocate_local_result_dir
     run_prefix = None
     result_dir = cfg.get('result_dir') or allocate_local_result_dir(LOCAL_RUNS_DIR)
 
     cmd = [
-        _runner_python(), "-m", "osworld_agent.run_local",
+        _runner_python(), "-m", f"{_PACKAGE_NAME}.run_local",
         "--task", task,
         "--model", model,
         "--model-url", model_url,
@@ -1142,13 +1143,13 @@ def _start_local(cfg: dict, viz_port: int | None = None):
         cmd += ["--browser-start-url", start_url]
     try:
         cmd += _wait_cli_args(cfg)
-        from osworld_agent.prompt_settings import prompt_cli_args
+        from ..planning.prompt_settings import prompt_cli_args
         cmd += prompt_cli_args(cfg.get('mode_prompts'), Path(LOCAL_RUNS_DIR) / '.prompt_configs')
         cmd += ['--workspace-dir', workspace]
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
     if cfg.get("completion_spec") is not None:
-        from osworld_agent.verifiers import CompletionVerifier
+        from ..verification.verifiers import CompletionVerifier
         try:
             contract = CompletionVerifier(task, cfg["completion_spec"]).spec
         except ValueError as exc:
@@ -1194,7 +1195,7 @@ def _start_local(cfg: dict, viz_port: int | None = None):
 
 def _wait_cli_args(cfg):
     import math
-    from osworld_agent.knowledge_selection import selection_cli_args
+    from ..memory.knowledge_selection import selection_cli_args
     result = _judge_cli_args(cfg) + selection_cli_args(cfg)
     for field, flag, default in (("operation_timeout_s", "--operation-timeout", 300),
                                   ("task_timeout_s", "--task-timeout", 1800)):
@@ -1215,7 +1216,7 @@ def _wait_cli_args(cfg):
 
 def _judge_cli_args(cfg):
     """Both runners use the same validated optional System One configuration."""
-    from osworld_agent.model.decision_judge import DecisionJudgeConfig
+    from ..model.decision_judge import DecisionJudgeConfig
     data = cfg.get('decision_judge') or {}
     if not isinstance(data, dict):
         raise ValueError('Decision 评估器配置必须是对象')
@@ -1360,7 +1361,7 @@ def _parse_tasks_file(path):
 def _build_batch_cmd(cfg, task, result_dir):
     """批量子进程命令：复用与单条一致的模型 / grounding / 判效 / 知识配置。"""
     cmd = [
-        _runner_python(), "-m", "osworld_agent.run_local",
+        _runner_python(), "-m", f"{_PACKAGE_NAME}.run_local",
         "--task", task,
         "--model", cfg.get("model", "Qwen3.6-27B"),
         "--model-url", cfg.get("model_url", "http://10.44.101.62:8094/v1"),
@@ -1377,7 +1378,7 @@ def _build_batch_cmd(cfg, task, result_dir):
     except ValueError:
         pass
     try:
-        from osworld_agent.workspace_config import default_workspace_root, normalize_workspace_root
+        from ..runtime.workspace_config import default_workspace_root, normalize_workspace_root
         workspace = normalize_workspace_root(cfg.get('workspace_dir') or default_workspace_root())
         cmd += ['--workspace-dir', workspace]
     except ValueError:
@@ -1404,7 +1405,7 @@ def _read_run_result(result_dir):
 
 
 def _run_batch_worker(cfg, tasks):
-    from osworld_agent.workspace_config import allocate_local_result_dir
+    from ..runtime.workspace_config import allocate_local_result_dir
     report_path = os.path.join(LOCAL_RUNS_DIR, 'batch_report_' + time.strftime('%Y%m%d_%H%M%S') + '.csv')
     results = []
     env = os.environ.copy()
@@ -1518,7 +1519,7 @@ async def start_run(request: Request):
     except Exception:
         return {"ok": False, "error": "invalid json"}
 
-    from osworld_agent.prompt_settings import validate_mode_prompts
+    from ..planning.prompt_settings import validate_mode_prompts
     try:
         cfg['mode_prompts'] = validate_mode_prompts(cfg.get('mode_prompts'))
     except ValueError as exc:
@@ -1545,7 +1546,7 @@ async def start_run(request: Request):
     max_steps = int(cfg.get("max_steps", 40))
 
     cmd = [
-        _runner_python(), "-m", "osworld_agent.viz.runner",
+        _runner_python(), "-m", f"{_PACKAGE_NAME}.viz.runner",
         "--task-id", task_id,
         "--examples-dir", EXAMPLES_DIR,
         "--domain", domain,
@@ -1562,7 +1563,7 @@ async def start_run(request: Request):
     ]
     try:
         cmd += _wait_cli_args(cfg)
-        from osworld_agent.prompt_settings import prompt_cli_args
+        from ..planning.prompt_settings import prompt_cli_args
         cmd += prompt_cli_args(cfg.get('mode_prompts'), Path(LOCAL_RUNS_DIR) / '.prompt_configs')
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
@@ -1673,7 +1674,7 @@ async def manual_eval():
 @app.get("/experiments/default-prompt")
 async def get_default_prompt(backend: str = "native", browser_only: bool = False, os_name: str = ''):
     try:
-        from osworld_agent.prompts import build_mode_system_prompts, build_editable_mode_prompts
+        from ..prompts import build_mode_system_prompts, build_editable_mode_prompts
         os_name = os_name or ('windows' if sys.platform == 'win32' else 'mac' if sys.platform == 'darwin' else 'linux')
         if os_name not in {'windows', 'mac', 'linux'}:
             return {'ok': False, 'error': 'Unsupported operating system'}
@@ -1855,7 +1856,7 @@ def _debug_chat_request(payload):
     base_url = str(engine.get("base_url") or "").strip()
     messages = payload.get("messages") or []
     generation = payload.get("generation") or {}
-    from osworld_agent.config import resolve_secret
+    from ..config import resolve_secret
     try:
         api_key = resolve_secret(payload.get("api_key") or "EMPTY")
     except (RuntimeError, TypeError) as exc:
@@ -1934,7 +1935,7 @@ def _debug_chat_request(payload):
 def _keep_model_warm():
     """可选的自托管模型保活；API 决策模型仅在显式给出 URL 时才保活。"""
     import requests as _req
-    from osworld_agent.prompts import build_system_prompt
+    from ..prompts import build_system_prompt
     sys_prompt = build_system_prompt(browser_only=True)
     dec_url = os.getenv("OSWORLD_DECISION_URL", "")
     dec_model = os.getenv("OSWORLD_DECISION_MODEL", "Qwen3.6-27B")

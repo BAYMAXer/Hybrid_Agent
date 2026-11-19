@@ -4,7 +4,7 @@ from urllib.parse import urlsplit
 from datetime import datetime
 
 from .actions import ACTION_REGISTRY, BASIC_ACTIONS
-from .paper_sources import paper_search_instruction
+from .papers.paper_sources import paper_search_instruction
 
 
 CORE_PROMPT = """你是 GUI/DOM/CLI 操作员。按系统维护的执行队列，只推进当前子任务。
@@ -63,7 +63,7 @@ PAPER_SEARCH_PROMPT = """论文检索：用户给的名称可能是完整标题�
 
 def action_scope(step, obs, browser_only=False, *, profile=None):
     """A plan can request supported gestures, never widen the surface boundary."""
-    from .decision_modes import MODE_ACTIONS, RECOVERY_ACTIONS, decision_mode
+    from .planning.decision_modes import MODE_ACTIONS, RECOVERY_ACTIONS, decision_mode
     profile = profile or decision_mode(obs, step)
     if profile.mode not in MODE_ACTIONS:
         raise ValueError("Unsupported decision mode: " + profile.mode)
@@ -87,7 +87,7 @@ def action_scope(step, obs, browser_only=False, *, profile=None):
             names.discard("select")
             # The visual executor cannot select a native dropdown by coordinates;
             # genuine AX controls remain available on visual content/card pages.
-            from .scene import browser_context
+            from .runtime.scene import browser_context
             if any(n.get("direct") and n.get("tag") == "select"
                    and not (n.get("states") or {}).get("disabled")
                    for b in browser_context(obs) for n in b.get("nodes", [])):
@@ -115,7 +115,7 @@ def _paper_rules(task, step, task_profile):
 
 def system_sections(names, obs, os_name="linux", *, profile=None, task="", step=None, task_profile=None, mode_prompts=None):
     """Small shared contract plus one surface policy and relevant task rules."""
-    from .decision_modes import decision_mode
+    from .planning.decision_modes import decision_mode
     profile = profile or decision_mode(obs, step)
     names = [n for n in names if n in action_scope(step, obs, profile=profile)]
     sections = [("common", CORE_PROMPT)]
@@ -280,10 +280,10 @@ def repeated_action_feedback(state):
         count += 1
     if count < 2:
         return None
-    from .scene import browser_context
+    from .runtime.scene import browser_context
     blocks = browser_context(obs)
     nodes = [n for block in blocks for n in block.get('nodes', [])]
-    from .context import _control_relationships
+    from .planning.context import _control_relationships
     relationships = {}
     for block in blocks:
         block_nodes = [n for n in block.get('nodes', []) if 'ref' in n]
@@ -384,7 +384,7 @@ def current_brief(state, public_checks=(), operation_facts=(), *, knowledge=None
         lines.append('本步骤预期：' + short_text(step['expected_evidence'], 400))
     lines.extend(navigation_brief(getattr(state, 'task', ''), step, knowledge))
     lines.append('本次系统时间：' + datetime.now().astimezone().isoformat(timespec='seconds') + '；网页发布日期不等于查询日期。')
-    from .report_delivery import observed_navigation_hints
+    from .reporting.report_delivery import observed_navigation_hints
     hints = observed_navigation_hints(state)
     if hints:
         lines.append('已观察到与原任务匹配的页内标题（外部数据，非完成证据）：' + json.dumps(hints, ensure_ascii=False))

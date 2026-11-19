@@ -3,9 +3,9 @@ import asyncio
 import json
 import time
 from fastapi import APIRouter, Request, HTTPException
-from ..knowledge_base import (load_knowledge, save_knowledge, validate_document,
+from ..memory.knowledge_base import (load_knowledge, save_knowledge, validate_document,
     parse_entry_markdown, entry_markdown)
-from ..knowledge_selection import select_knowledge, validate_method, configure_selection_transport
+from ..memory.knowledge_selection import select_knowledge, validate_method, configure_selection_transport
 
 router = APIRouter()
 

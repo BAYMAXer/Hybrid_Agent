@@ -17,17 +17,17 @@ import os
 import sys
 from pathlib import Path
 
-_here = os.path.dirname(os.path.abspath(__file__))
-_pkg = os.path.dirname(_here)
-if _pkg not in sys.path:
-    sys.path.insert(0, _pkg)
+if not __package__:
+    package_dir = Path(__file__).absolute().parents[1]
+    sys.path.insert(0, str(package_dir.parent))
+    __package__ = f"{package_dir.name}.adapters"
 
-from osworld_agent.config import ModelConfig  # noqa: E402
-from osworld_agent.model import ChatModel  # noqa: E402
-from osworld_agent.agent import Agent  # noqa: E402
-from osworld_agent.adapters.docker_env import DockerEnvironment  # noqa: E402
-from osworld_agent.adapters.uitars_grounding import RealUItarsGrounding  # noqa: E402
-from osworld_agent.adapters.uivenus2_grounding import UIVenus2Grounding  # noqa: E402
+from ..config import ModelConfig  # noqa: E402
+from ..model import ChatModel  # noqa: E402
+from ..agent import Agent  # noqa: E402
+from .docker_env import DockerEnvironment  # noqa: E402
+from .uitars_grounding import RealUItarsGrounding  # noqa: E402
+from .uivenus2_grounding import UIVenus2Grounding  # noqa: E402
 
 
 def load_manifest(path: str) -> dict:
@@ -131,7 +131,7 @@ def main() -> int:
                 if traj_lines:
                     (task_dir / "traj.jsonl").write_text("\n".join(traj_lines), encoding="utf-8")
                 # 导出标准训练轨迹（供 SFT / RL，reward 留空待回填）
-                from osworld_agent.trajectory import build_trajectory, dump_trajectory
+                from ..trajectory import build_trajectory, dump_trajectory
                 trajectory = build_trajectory(
                     task_id=task_id, domain=domain, instruction=instruction, result=result)
                 dump_trajectory(str(task_dir / "trajectory.json"), trajectory)

@@ -1,26 +1,28 @@
-# 文鳐 Yaero · Agent_frame
+# 文鳐 Yaero · Hybrid Agent
 
 支持 GUI、DOM 与 CLI 的智能体框架，提供实时监控、轨迹回看、知识库与 Jev 核查。
 
-当前开发代码已更新至 2026-10-19；Windows 安装与更新请看 [Windows 快速开始](docs/windows-quickstart.md)。
-此仓库保留上游版本历史，下方 v0.2.0 是上游基线版本，不代表当前开发快照。
+```bash
+git clone https://github.com/BAYMAXer/Hybrid_Agent.git hybrid_agent
+```
 
-上游基线：**0.2.0**（[v0.2.0 Release](https://github.com/BAYMAXer/Agent_frame/releases/tag/v0.2.0)）。
+以下 `python -m hybrid_agent.…` 命令从 `hybrid_agent` 的父目录执行。Windows 和 macOS 的安装命令见[连接远程模型运行](#连接远程模型运行)，Linux MiniWoB++ 的安装和评测见[运行指南](docs/miniwob-linux.md)。
 
-源码直接位于仓库根目录，不同版本通过 Git 标签保存。
+## 目录结构
 
-| 版本 | 对应源码 |
+| 位置 | 内容 |
 | --- | --- |
-| [v0.1.0](https://github.com/BAYMAXer/Agent_frame/tree/v0.1.0) | 原 osworld_agent_1009 代码 |
-| [v0.2.0](https://github.com/BAYMAXer/Agent_frame/tree/v0.2.0) | 原 osworld_agent_1010 代码 |
+| 根目录 | `agent.py`、`pipeline.py` 等框架接口，`main.py`、`run_local.py` 等 Python 入口，以及默认 `config.yaml` |
+| `planning/`、`runtime/`、`verification/` | 任务规划、执行与运行状态、证据及完成验收 |
+| `browser/`、`desktop/`、`adapters/` | 浏览器交互、桌面操作和环境适配 |
+| `papers/`、`reporting/`、`memory/` | 论文检索与核验、报告交付、知识库及记忆 |
+| `training/`、`rl/`、`trajectory.py` | 人工示范、训练事件、强化学习和轨迹导出 |
+| `config/`、`model/`、`skills/` | 配置注册表、模型接入和技能 |
+| `viz/`、`comparison/` | Studio 界面和 Jev 对比 |
+| `scripts/`、`requirements/`、`tests/` | 启动脚本、各平台依赖和测试 |
+| `docs/`、`docs/archive/` | 运行指南及历史分发包清单 |
 
-环境搭建：[本地环境搭建指南](docs/本地环境搭建指南.md)。
-
-入口和测试使用 osworld_agent 包名。克隆时可将仓库目录命名为 osworld_agent：
-
-~~~powershell
-git clone https://github.com/dingyuer/Agent_frame.git osworld_agent
-~~~
+上游基线为 [Agent_frame v0.2.0](https://github.com/BAYMAXer/Agent_frame/releases/tag/v0.2.0)。
 
 ## 浏览器执行与系统验收
 
@@ -496,11 +498,11 @@ Web 前端使用 `env:DASHSCOPE_API_KEY` 引用密钥，不会把真实值写入
 旧版 `qwen-flash` 只适合纯文本调用；本框架默认会发送当前截图，因此应使用支持图片输入的
 Flash 型号。
 
-下列命令在 `osworld_agent` 的父目录运行，本机须有 Windows 浏览器运行依赖及带 remote debugging
+下列命令在 `hybrid_agent` 的父目录运行，本机须有 Windows 浏览器运行依赖及带 remote debugging
 的 Chrome。模型均可位于其他机器；`AAA` 和模型名称、端点需替换为实际值。
 
 ```powershell
-python -m osworld_agent.run_windows_local --task "请下载一篇叫做AAA的论文" --model DECISION_MODEL --model-url http://MODEL_HOST:9028/v1 --planner-model PLANNER_MODEL --planner-url http://PLANNER_HOST:9028/v1 --ground-type ui-tars --ground-model UI-TARS-1.5-7B --ground-url http://GROUND_HOST:49999/v1 --max-steps 30 --result-dir ./runs/paper-001
+python -m hybrid_agent.run_windows_local --task "请下载一篇叫做AAA的论文" --model DECISION_MODEL --model-url http://MODEL_HOST:9028/v1 --planner-model PLANNER_MODEL --planner-url http://PLANNER_HOST:9028/v1 --ground-type ui-tars --ground-model UI-TARS-1.5-7B --ground-url http://GROUND_HOST:49999/v1 --max-steps 30 --result-dir ./runs/paper-001
 ```
 
 macOS 本机运行使用同一套决策、浏览器 CDP、下载与验收逻辑；`run_local` 根据运行主机自动选择
@@ -508,24 +510,24 @@ macOS 或 Windows 适配器，Studio 的「本机任务」也自动选择，无�
 Studio 的「默认工程文件夹」可用系统文件夹选择器或绝对路径设置，选择会保存在本机；每天只在
 该目录下创建一个日期文件夹，当天任务的下载和运行日志都放在里面。浏览器通过 CDP 操作且不要求窗口固定位置，
 运行时可以拖动新启动的 Chrome 窗口。
-Windows 迁移时请保持解压后的目录名为 `osworld_agent`，在它的父目录打开 PowerShell，使用 Python 3.12 和已安装的 Google Chrome：
+Windows 迁移时请保持解压后的目录名为 `hybrid_agent`，在它的父目录打开 PowerShell，使用 Python 3.12 和已安装的 Google Chrome：
 
 ```powershell
 py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r osworld_agent\requirements-windows.txt
+.\.venv\Scripts\python.exe -m pip install -r hybrid_agent\requirements\requirements-windows.txt
 .\.venv\Scripts\python.exe -m playwright install chromium
-Copy-Item osworld_agent\.env.example osworld_agent\.env
-# 在 osworld_agent\.env 中填写本机的 DASHSCOPE_API_KEY
-powershell -ExecutionPolicy Bypass -File osworld_agent\start_studio_windows.ps1
+Copy-Item hybrid_agent\.env.example hybrid_agent\.env
+# 在 hybrid_agent\.env 中填写本机的 DASHSCOPE_API_KEY
+powershell -ExecutionPolicy Bypass -File hybrid_agent\scripts\start_studio_windows.ps1
 ```
 
 打开 `http://127.0.0.1:8090`，先选择默认工程文件夹。普通任务可以直接输入“搜索论文 Attention is all you need 并下载 PDF 到默认工程文件夹”；“稳定演示：本地标题搜索回放 → 官方 PDF 下载”按钮会将这句话送给规划与决策模型，同时仅把已标注的本地搜索回放页设为浏览器初始状态。论文 ID、作者与 PDF 地址不作为预填任务条件，须从搜索结果和官方页面获得。本地回放可以演示操作与核验链路，但不能宣称 arXiv 在线搜索已通过。Windows 专用 Chrome 以无启动窗口方式连接 CDP，再由隔离任务上下文创建一扇可拖动的任务窗口；任务结束后关闭本次专用浏览器。
-在 macOS 安装依赖并运行（仍从 `osworld_agent` 的父目录执行）：
+在 macOS 安装依赖并运行（仍从 `hybrid_agent` 的父目录执行）：
 
 ```bash
-python3.12 -m venv osworld_agent/.venv-mac
-osworld_agent/.venv-mac/bin/python -m pip install -r osworld_agent/requirements-mac.txt
-osworld_agent/.venv-mac/bin/python -m osworld_agent.run_local --task "打开 example.org"
+python3.12 -m venv hybrid_agent/.venv-mac
+hybrid_agent/.venv-mac/bin/python -m pip install -r hybrid_agent/requirements/requirements-mac.txt
+hybrid_agent/.venv-mac/bin/python -m hybrid_agent.run_local --task "打开 example.org"
 ```
 
 浏览器任务通过专用 Chrome 和 CDP 工作。要执行 `observe_desktop` 及桌面鼠标键盘操作，
@@ -564,8 +566,8 @@ DOM 失败后刷新和视觉恢复各自保留记录，不会只剩最后一次�
 ### 两类 SFT 导出
 
 ```bash
-python -m osworld_agent.trajectory runs/paper-001/trajectory.json --mode sft-planner --output planner.jsonl
-python -m osworld_agent.trajectory runs/paper-001/trajectory.json --mode sft-decision --image-paths --output decision.jsonl
+python -m hybrid_agent.trajectory runs/paper-001/trajectory.json --mode sft-planner --output planner.jsonl
+python -m hybrid_agent.trajectory runs/paper-001/trajectory.json --mode sft-decision --image-paths --output decision.jsonl
 ```
 
 默认仅选择独立验收成功的 episode；规划调用须有有效计划标记。
@@ -629,8 +631,8 @@ Windows 环境使用每轮独立 BrowserContext、空白页和下载目录；这
 将摘要替换为真实评测值，然后运行：
 
 ```bash
-python -m osworld_agent.rl.rollout --factory training_setup:create_agent --tasks tasks.jsonl --output-dir runs/rollouts --n 4 --max-steps 30 --policy-revision CHECKPOINT_REVISION
-python -m osworld_agent.trajectory runs/rollouts/EPISODE_ID/trajectory.json --mode rl --policy-revision CHECKPOINT_REVISION --output rollout.jsonl
+python -m hybrid_agent.rl.rollout --factory training_setup:create_agent --tasks tasks.jsonl --output-dir runs/rollouts --n 4 --max-steps 30 --policy-revision CHECKPOINT_REVISION
+python -m hybrid_agent.trajectory runs/rollouts/EPISODE_ID/trajectory.json --mode rl --policy-revision CHECKPOINT_REVISION --output rollout.jsonl
 ```
 
 collector 正确传递每轮步数预算，并将私有条件仅交给验收器。未知 reward 不得进入负奖励统计；
@@ -646,37 +648,25 @@ OCR 定位兜底仅使用唯一精确文字匹配，不会暗中额外调用决�
 
 ## 测试
 
-默认离线测试使用模拟模型、CDP 与临时文件，不连接模型端点或启动真实浏览器：
+当前测试使用本机 Chromium 和模拟模型验证 MiniWoB++ 的页面观察、动作路由及环境评分。从 `hybrid_agent` 的父目录运行：
 
 ```bash
 python -m venv .venv
-.venv/bin/python -m pip install -r requirements-test.txt
-.venv/bin/python -m pytest -q
+.venv/bin/python -m pip install -r hybrid_agent/requirements/requirements-test.txt -r hybrid_agent/requirements/requirements-miniwob.txt
+.venv/bin/python -m pytest -q hybrid_agent/tests
 ```
 
-`requirements-test.txt` 包含严格 PDF 验收所需的 `pypdf`。Windows 使用 `.venv\Scripts\python`；
-测试支持任意克隆目录名。
-
-本地 Chromium 集成测试通过 `--run-browser-integration` 显式启用，需要另外安装 Playwright
-和 Chromium；它使用受控本地页面验证浏览器机制，不评估远程模型的任务能力：
-
-```bash
-.venv/bin/python -m pip install playwright
-.venv/bin/python -m playwright install chromium
-.venv/bin/python -m pytest -q --run-browser-integration
-```
-
-真实网站布局、访问限制、浏览器原生 UI 与远程模型/processor 协议仍需在部署环境回归。
+Windows 使用 `.venv\Scripts\python.exe`。浏览器和驱动的准备方式见 [MiniWoB++ 运行指南](docs/miniwob-linux.md)。
 
 ## 人工演示采集
 
 Studio 的「SFT 采集」用于人工执行浏览器任务并审阅示范，无须部署决策模型或定位模型。
-在名为 `osworld_agent` 的仓库目录的父目录，使用选定的 Python 环境运行：
+在名为 `hybrid_agent` 的仓库目录的父目录，使用选定的 Python 环境运行：
 
 ```bash
-python -m pip install -r osworld_agent/requirements-viz.txt
+python -m pip install -r hybrid_agent/requirements/requirements-viz.txt
 python -m playwright install chromium
-python -m osworld_agent.viz.server
+python -m hybrid_agent.viz.server
 ```
 
 打开 `http://127.0.0.1:8088`，进入「SFT 采集」。端口可通过 `AGENTS_VIZ_PORT` 环境变量调整，

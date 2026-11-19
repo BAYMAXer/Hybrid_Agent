@@ -7,7 +7,7 @@ import sys
 
 from fastapi import APIRouter, HTTPException, Request
 
-from ..workspace_config import default_workspace_root, save_workspace_root
+from ..runtime.workspace_config import default_workspace_root, save_workspace_root
 
 router = APIRouter(prefix='/workspace', tags=['Workspace'])
 

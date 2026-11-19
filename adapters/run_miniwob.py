@@ -100,7 +100,7 @@ def public_config(cfg):
 
 
 def make_manifest(args, tasks, cfg):
-    from ..knowledge_base import load_knowledge
+    from ..memory.knowledge_base import load_knowledge
 
     config = public_config(cfg)
     digest = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()

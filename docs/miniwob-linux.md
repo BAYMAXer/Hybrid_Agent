@@ -2,19 +2,19 @@
 
 ## 一键运行 15 局
 
-在 Linux 机器上把运行包解压到有写权限的目录，然后执行：
+在 Linux 上将仓库克隆到有写权限的目录，然后从其父目录运行：
 
 ```bash
-tar -xzf hybrid-agent-miniwob-linux.tar.gz
-bash hybrid_agent/run_miniwob_pilot.sh
+git clone https://github.com/BAYMAXer/Hybrid_Agent.git hybrid_agent
+bash hybrid_agent/scripts/run_miniwob_pilot.sh
 ```
 
 脚本自动准备虚拟环境并安装 Python 依赖，先用固定动作运行浏览器自检。自检取得官方奖励 `+1` 后，使用项目原有的 `hybrid_agent/config.yaml` 运行 `click-test-2`、`enter-text`、`click-checkboxes`，每个任务跑 seed 0–4。决策和规划默认请求 `Qwen3.6-27B`（`http://10.44.101.62:8094/v1`），视觉定位请求 `UI-Venus-2-9B`（`http://7.246.80.189:8001/v1`）。请确保评测机可访问这两个服务。仅做浏览器自检时用下方的 `--smoke-test` 命令。
 
-结果保存在解压目录的 `runs/miniwob-pilot/summary.json`。中断后再次执行同一脚本即可续跑。若改了模型配置，或想从头再跑一次，可为新批次指定另一个目录：
+结果保存在仓库父目录的 `runs/miniwob-pilot/summary.json`。中断后可用相同代码和配置再次执行同一脚本来续跑。源码或配置变动后，或需要从头再跑时，请为新批次指定另一个目录：
 
 ```bash
-MINIWOB_OUTPUT_DIR=runs/miniwob-pilot-2 bash hybrid_agent/run_miniwob_pilot.sh
+MINIWOB_OUTPUT_DIR=runs/miniwob-pilot-2 bash hybrid_agent/scripts/run_miniwob_pilot.sh
 ```
 
 脚本优先使用本机已有的浏览器和驱动，也支持显式设置 `MINIWOB_CHROME_BINARY` 和 `MINIWOB_CHROMEDRIVER` 两个绝对路径。Debian 缺少 Chromium 或驱动时，脚本可通过 `apt-get` 安装。其他 Linux 环境未找到现成组合时，自检会调用 Selenium Manager 发现或下载浏览器和驱动；首次自动下载需能访问对应软件源，并具备 Chrome 所需的系统共享库。安装系统包可能需要 `sudo`；评测本身使用当前用户运行。[Selenium Manager 说明](https://www.selenium.dev/documentation/selenium_manager/)
@@ -30,7 +30,7 @@ sudo apt-get update
 sudo apt-get install -y python3-venv chromium chromium-driver
 python3 -m venv .venv-miniwob
 source .venv-miniwob/bin/activate
-python -m pip install -r hybrid_agent/requirements-miniwob.txt
+python -m pip install -r hybrid_agent/requirements/requirements-miniwob.txt
 
 export MINIWOB_CHROME_BINARY="$(command -v chromium)"
 export MINIWOB_CHROMEDRIVER="$(command -v chromedriver)"

@@ -5,8 +5,8 @@ import time
 from pathlib import Path
 
 from ..env import Environment, Observation, StepResult
-from ..cli_executor import cli_capability, execute_cli
-from ..workspace_config import default_workspace_root
+from ..runtime.cli_executor import cli_capability, execute_cli
+from ..runtime.workspace_config import default_workspace_root
 
 
 class CLIEnvironment(Environment):

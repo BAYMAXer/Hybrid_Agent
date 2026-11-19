@@ -7,7 +7,7 @@ other deterministic completion checks.
 import json
 
 from .decision_judge import DecisionJudge
-from ..scene import browser_context
+from ..runtime.scene import browser_context
 
 
 class RuntimeDecisionJudge(DecisionJudge):

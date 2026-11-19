@@ -24,7 +24,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse, JSONResponse
 
 from ..actions import Action
-from ..browser_session import BrowserOptions, BrowserSession
+from ..browser.browser_session import BrowserOptions, BrowserSession
 from ..env import Observation
 from ..model.decision_model import encode_image
 
@@ -123,7 +123,7 @@ class CollectionController:
             if not task or len(task) > 8000:
                 raise CollectionError("请填写任务描述（最多 8000 字）。")
             start_url = http_url(payload.get("start_url")) if payload.get("start_url") else None
-            from ..verifiers import CompletionVerifier
+            from ..verification.verifiers import CompletionVerifier
             CompletionVerifier(task, payload.get("completion_spec"))  # Validate before launching anything.
             self._close_browser()
             if self.recorder is not None:
@@ -152,7 +152,7 @@ class CollectionController:
                     if result.get("status") != "executed":
                         raise CollectionError("起始页面未能打开：" + str(result.get("error", "请检查网址")))
                 if self.recorder_factory is None:
-                    from ..human_demonstration import HumanDemonstrationSession
+                    from ..training.human_demonstration import HumanDemonstrationSession
                     factory = HumanDemonstrationSession
                 else:
                     factory = self.recorder_factory

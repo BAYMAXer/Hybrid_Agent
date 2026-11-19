@@ -126,7 +126,7 @@ def _processes(platform, profile, port):
         owned = {row['pid'] for row in _profile_processes(profile, rows)}
         listeners = {row['pid'] for row in rows if port in (row.get('ports') or [])}
         return owned, listeners
-    from .mac_chrome import _listener_pids, _profile_pids
+    from .browser.mac_chrome import _listener_pids, _profile_pids
     return _profile_pids(profile), _listener_pids(port)
 
 
@@ -141,7 +141,7 @@ def ensure_persistent_chrome(port, chrome_path, *, profile_dir=None, platform=No
     if not 1 <= port <= 65535:
         raise ValueError('浏览器调试端口必须在 1 到 65535 之间')
     profile = prepare_persistent_profile(profile_dir, platform=platform)
-    from .mac_chrome import _cdp_ready
+    from .browser.mac_chrome import _cdp_ready
     if _port_open(port):
         if not _endpoint_owned(platform, profile, port) or not _cdp_ready(port):
             raise RuntimeError(f'端口 {port} 不属于指定的固定任务配置，请使用空闲端口；不会接管其他浏览器')
@@ -188,7 +188,7 @@ def close_persistent_chrome(port, profile):
         return
     try:
         from playwright.sync_api import sync_playwright
-        from .utils import cdp_websocket_endpoint
+        from .browser.utils import cdp_websocket_endpoint
         if _endpoint_owned(platform, profile, port):
             with sync_playwright() as runtime:
                 browser = runtime.chromium.connect_over_cdp(cdp_websocket_endpoint('localhost', port), timeout=3000)
@@ -231,7 +231,7 @@ def main():
     elif platform == 'windows':
         from .run_windows_local import CHROME_DEFAULT as chrome
     else:
-        from .mac_chrome import CHROME_DEFAULT as chrome
+        from .browser.mac_chrome import CHROME_DEFAULT as chrome
     created, profile = ensure_persistent_chrome(args.browser_port, chrome,
         profile_dir=args.browser_profile_dir or browser_settings()['browser_profile_dir'] or None,
         platform=platform)
@@ -240,7 +240,7 @@ def main():
             # Commit only after ownership and a working task endpoint are confirmed.
             save_browser_settings('persistent', profile)
         from playwright.sync_api import sync_playwright
-        from .utils import cdp_websocket_endpoint
+        from .browser.utils import cdp_websocket_endpoint
         with sync_playwright() as runtime:
             browser = runtime.chromium.connect_over_cdp(cdp_websocket_endpoint('localhost', args.browser_port))
             page = browser.contexts[0].new_page()

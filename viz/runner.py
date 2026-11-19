@@ -11,20 +11,24 @@ import os
 import sys
 import time
 from collections import defaultdict
+from pathlib import Path
 
-_here = os.path.dirname(os.path.abspath(__file__))
-_pkg = os.path.dirname(_here)
-if _pkg not in sys.path:
-    sys.path.insert(0, _pkg)
+_PACKAGE_DIR = Path(__file__).absolute().parents[1]
+if not __package__:
+    # Avoid shadowing the standard-library logging module with viz/logging.py.
+    if sys.path and Path(sys.path[0]) == _PACKAGE_DIR / "viz":
+        sys.path.pop(0)
+    sys.path.insert(0, str(_PACKAGE_DIR.parent))
+    __package__ = f"{_PACKAGE_DIR.name}.viz"
 
-from osworld_agent.config import ModelConfig  # noqa: E402
-from osworld_agent.model import ChatModel  # noqa: E402
-from osworld_agent.agent import Agent  # noqa: E402
-from osworld_agent.adapters.vmware_env import VMwareEnvironment  # noqa: E402
-from osworld_agent.adapters.uitars_grounding import RealUItarsGrounding  # noqa: E402
-from osworld_agent.adapters.uivenus2_grounding import UIVenus2Grounding  # noqa: E402
-from osworld_agent.adapters.task_loader import load_task_config  # noqa: E402
-from osworld_agent.viz.logging import (  # noqa: E402
+from ..config import ModelConfig  # noqa: E402
+from ..model import ChatModel  # noqa: E402
+from ..agent import Agent  # noqa: E402
+from ..adapters.vmware_env import VMwareEnvironment  # noqa: E402
+from ..adapters.uitars_grounding import RealUItarsGrounding  # noqa: E402
+from ..adapters.uivenus2_grounding import UIVenus2Grounding  # noqa: E402
+from ..adapters.task_loader import load_task_config  # noqa: E402
+from .logging import (  # noqa: E402
     LoggingChatModel, LoggingGrounding, log_status, set_results_dir,
     get_collected, reset_collected, flush_logs,
 )
@@ -32,9 +36,9 @@ from osworld_agent.viz.logging import (  # noqa: E402
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    from osworld_agent.model.decision_judge import add_judge_arguments, judge_config_from_args
+    from ..model.decision_judge import add_judge_arguments, judge_config_from_args
     add_judge_arguments(parser)
-    from osworld_agent.knowledge_selection import add_knowledge_arguments
+    from ..memory.knowledge_selection import add_knowledge_arguments
     add_knowledge_arguments(parser)
     parser.add_argument('--judge-selection-policy', choices=['threshold', 'maximum_probability'],
                         default='maximum_probability', help='Jev 标签选择：最高概率或阈值与分差')
@@ -62,11 +66,11 @@ def main() -> None:
     parser.add_argument("--screen-height", type=int, default=1080)
     parser.add_argument('--mode-prompts-file', help='Studio 保存的各模式决策提示词 JSON')
     args = parser.parse_args()
-    from osworld_agent.prompt_settings import load_mode_prompts
+    from ..planning.prompt_settings import load_mode_prompts
     mode_prompts = load_mode_prompts(args.mode_prompts_file)
 
     results_root = os.getenv("AGENTS_RESULTS_DIR",
-                             os.path.join(_pkg, "viz", "runs"))
+                             str(_PACKAGE_DIR / "viz" / "runs"))
     safe_model = args.model.replace("/", "_")
     model_dir = os.path.join(results_root, "pyautogui", "screenshot", safe_model)
     base_dir = os.path.join(model_dir, args.domain)
@@ -96,7 +100,7 @@ def main() -> None:
 
     # 3) grounding（包装，记录定位）
     if args.ground_type == "qwen-plus":
-        from osworld_agent.adapters.qwen_grounding import QwenPlusGrounding
+        from ..adapters.qwen_grounding import QwenPlusGrounding
         _ground = QwenPlusGrounding(
             url=args.ground_url, api_key=args.ground_api_key, model=args.ground_model,
             width=args.screen_width, height=args.screen_height)
@@ -168,7 +172,7 @@ def main() -> None:
             f.write(json.dumps(line, ensure_ascii=False) + "\n")
 
     # 导出标准训练轨迹（供 SFT / RL，reward 留空待回填）
-    from osworld_agent.trajectory import build_trajectory, dump_trajectory
+    from ..trajectory import build_trajectory, dump_trajectory
     trajectory = build_trajectory(
         task_id=example_id, domain=args.domain, instruction=instruction,
         result=result,

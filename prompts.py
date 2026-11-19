@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 from .actions import ACTION_REGISTRY, ActionSpec
-from .paper_sources import paper_search_instruction
+from .papers.paper_sources import paper_search_instruction
 
 
 def build_system_prompt(action_registry=None, skill_registry=None, os_name="linux", browser_only=False) -> str:
@@ -31,7 +31,7 @@ def build_mode_system_prompts(os_name="windows", browser_only=False):
     observation's capabilities and relevant task rules, never both mode bodies.
     """
     from .decision_context import action_scope, scoped_system
-    from .decision_modes import DecisionMode
+    from .planning.decision_modes import DecisionMode
     profiles = {"dom": DecisionMode("dom", "browser", "template_preview"),
                 "gui_browser": DecisionMode("gui", "browser", "template_preview"),
                 "gui_desktop": DecisionMode("gui", "desktop", "template_preview"),
@@ -44,7 +44,7 @@ def build_mode_system_prompts(os_name="windows", browser_only=False):
 def build_editable_mode_prompts(os_name="linux", browser_only=False):
     """Only the policy body is editable; live menus are always generated afresh."""
     from .decision_context import action_scope, system_sections
-    from .decision_modes import DecisionMode
+    from .planning.decision_modes import DecisionMode
     profiles = {"dom": DecisionMode("dom", "browser", "template_preview"),
                 "gui_browser": DecisionMode("gui", "browser", "template_preview"),
                 "gui_desktop": DecisionMode("gui", "desktop", "template_preview"),
@@ -140,7 +140,7 @@ def build_planner_prompt(task: str, completion_spec=None, profile=None) -> str:
     has_checks = bool((completion_spec or {}).get('checks'))
     download_rule = ('下载落盘使用 download_complete(check_id)，由框架核对对应产物' if has_checks else
                      '本任务没有系统 check_id；下载落盘使用 artifact_download(format)，format 为 ppt/pdf/any，框架核对本轮下载事件与落盘文件，check_ids 必须为 []')
-    from .task_specs import paper_download_intent
+    from .planning.task_specs import paper_download_intent
     paper_task = ((profile or {}).get('kind') == 'paper_download' or paper_download_intent(task)
                   or any(c.get('kind') == 'paper_download' for c in (completion_spec or {}).get('checks', [])
                          if isinstance(c, dict)))

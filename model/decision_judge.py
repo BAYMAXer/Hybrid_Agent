@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from .decision_model import encode_image
-from ..judge_evidence import select_frame, effect_review, terms, target_identity
+from ..verification.judge_evidence import select_frame, effect_review, terms, target_identity
 
 
 @dataclass(frozen=True)
@@ -370,7 +370,7 @@ class DecisionJudge:
                 'policy_trainable': False, 'reward_valid': False}
 
     def review_report(self, packet, step, *, remaining_s=None):
-        from ..report_review import REPORT_INSTRUCTION
+        from ..reporting.report_review import REPORT_INSTRUCTION
         requirements = packet['requirements']
         questions = {'step': {'type': 'choice', 'criteria': RESULT_CHOICES,
             'instructions': REPORT_INSTRUCTION + ' 原任务是否完整回答且所有实质性陈述有来源支持？'}}

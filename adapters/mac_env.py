@@ -18,16 +18,16 @@ class MacEnvironment(WindowsEnvironment):
         self.os_name = 'mac'
 
     def _runtime_state(self):
-        from ..mac_desktop import runtime_state
+        from ..desktop.mac_desktop import runtime_state
         return runtime_state()
 
     def _take_screenshot(self):
-        from ..mac_desktop import capture_virtual_desktop
+        from ..desktop.mac_desktop import capture_virtual_desktop
         shot, self._desktop_capture = capture_virtual_desktop()
         return shot
 
     def _step_desktop(self, action: Action) -> StepResult:
-        from .. import mac_desktop
+        from ..desktop import mac_desktop
         name = action.action
         if name == 'switch_applications':
             try:

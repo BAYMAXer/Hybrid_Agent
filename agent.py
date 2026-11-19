@@ -24,9 +24,9 @@ class Agent:
                  completion_spec=None, context_config=None, private_completion_spec=None,
                  planner_model=None, event_path=None, run_manifest=None, max_replans=3,
                  wait_config=None, verifier_model=None, progress_config=None, decision_judge=None, mode_prompts=None, knowledge_method="all", knowledge_jev_url=""):
-        from .prompt_settings import validate_mode_prompts
+        from .planning.prompt_settings import validate_mode_prompts
         self.mode_prompts = validate_mode_prompts(mode_prompts)
-        from .knowledge_selection import validate_method
+        from .memory.knowledge_selection import validate_method
         self.knowledge_method = validate_method(knowledge_method)
         self.knowledge_jev_url = knowledge_jev_url
         self.model = decision_model

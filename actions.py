@@ -150,7 +150,7 @@ def action_from_decision(obj: Dict[str, Any]) -> Optional[Action]:
 def validate_action(act: Action) -> Optional[str]:
     """校验动作是否合法；返回 None 表示合法，否则返回中文错误说明。"""
     if act.action == "cli":
-        from .cli_executor import validate_cli
+        from .runtime.cli_executor import validate_cli
         return validate_cli(act.args)
     spec = ACTION_REGISTRY.get(act.action) if act.action in BASIC_ACTIONS else None
     if spec is None:

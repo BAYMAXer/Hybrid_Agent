@@ -14,7 +14,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from ..env import Observation
 from ..model.decision_judge import DecisionJudge
-from ..step_verifier import code_review
+from ..verification.step_verifier import code_review
 from .jev_debug import _body, _config, _images
 
 router = APIRouter(prefix='/jev/demo', tags=['Jev presentation'])

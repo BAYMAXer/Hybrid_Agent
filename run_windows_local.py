@@ -23,19 +23,20 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
 
-_here = os.path.dirname(os.path.abspath(__file__))
-_parent = os.path.dirname(_here)
-if _parent not in sys.path:
-    sys.path.insert(0, _parent)
+if not __package__:
+    package_dir = Path(__file__).absolute().parent
+    sys.path.insert(0, str(package_dir.parent))
+    __package__ = package_dir.name
 
-from osworld_agent.config import ModelConfig          # noqa: E402
-from osworld_agent.model import ChatModel             # noqa: E402
-from osworld_agent.adapters.uivenus2_grounding import UIVenus2Grounding  # noqa: E402
-from osworld_agent.adapters.uitars_grounding import RealUItarsGrounding  # noqa: E402
-from osworld_agent.adapters.windows_env import WindowsEnvironment        # noqa: E402
-from osworld_agent.agent import Agent                 # noqa: E402
-from osworld_agent.viz.logging import (LoggingChatModel, LoggingGrounding,  # noqa: E402
+from .config import ModelConfig          # noqa: E402
+from .model import ChatModel             # noqa: E402
+from .adapters.uivenus2_grounding import UIVenus2Grounding  # noqa: E402
+from .adapters.uitars_grounding import RealUItarsGrounding  # noqa: E402
+from .adapters.windows_env import WindowsEnvironment        # noqa: E402
+from .agent import Agent                 # noqa: E402
+from .viz.logging import (LoggingChatModel, LoggingGrounding,  # noqa: E402
                                        set_results_dir, log_status, reset_collected, flush_logs)
 
 CHROME_DEFAULT = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
@@ -164,7 +165,7 @@ def _close_owned_cdp(port: int, profile: str) -> bool:
         return False
     try:
         from playwright.sync_api import sync_playwright
-        from osworld_agent.utils import cdp_websocket_endpoint
+        from .browser.utils import cdp_websocket_endpoint
         endpoint = cdp_websocket_endpoint("localhost", port, timeout=4)
         with sync_playwright() as p:
             browser = p.chromium.connect_over_cdp(endpoint, timeout=4000)
@@ -213,7 +214,7 @@ def _lifecycle_status(payload):
 
 def ensure_chrome(port: int, chrome_path: str, *, pdf_downloads=False):
     """确保可连接无痕 Chrome，返回 (是否新建, 本次专用 profile 目录)。"""
-    from osworld_agent.utils import cdp_pages_are_incognito, list_cdp_pages
+    from .browser.utils import cdp_pages_are_incognito, list_cdp_pages
     port = int(port)
     if not 1 <= port <= 65535:
         raise ValueError("浏览器调试端口必须在 1 到 65535 之间")
@@ -232,7 +233,7 @@ def ensure_chrome(port: int, chrome_path: str, *, pdf_downloads=False):
     proc = None
     try:
         if pdf_downloads:
-            from osworld_agent.browser_profile import prepare_pdf_download_profile
+            from .browser.browser_profile import prepare_pdf_download_profile
             prepare_pdf_download_profile(user_data_dir)
         proc = subprocess.Popen([
             chrome_path,
@@ -313,9 +314,9 @@ def main(platform: str = 'windows') -> int:
         previous_sigterm = signal.getsignal(signal.SIGTERM)
         signal.signal(signal.SIGTERM, lambda _signum, _frame: (_ for _ in ()).throw(SystemExit(143)))
     parser = argparse.ArgumentParser(description=f"{platform} 本地手动任务运行器")
-    from osworld_agent.model.decision_judge import add_judge_arguments, judge_config_from_args
+    from .model.decision_judge import add_judge_arguments, judge_config_from_args
     add_judge_arguments(parser)
-    from osworld_agent.knowledge_selection import add_knowledge_arguments
+    from .memory.knowledge_selection import add_knowledge_arguments
     add_knowledge_arguments(parser)
     parser.add_argument('--judge-selection-policy', choices=['threshold', 'maximum_probability'],
                         default='maximum_probability', help='Jev 标签选择：默认直接采用最高概率；threshold 使用阈值与分差')
@@ -356,7 +357,7 @@ def main(platform: str = 'windows') -> int:
     parser.add_argument("--browser-start-url", default=None,
                         help="可选初始浏览器页面；仅设置环境起点，不作为任务或论文身份信息")
     if platform == 'mac':
-        from osworld_agent.mac_chrome import CHROME_DEFAULT as MAC_CHROME_DEFAULT
+        from .browser.mac_chrome import CHROME_DEFAULT as MAC_CHROME_DEFAULT
         chrome_default = MAC_CHROME_DEFAULT
     else:
         chrome_default = CHROME_DEFAULT
@@ -370,10 +371,10 @@ def main(platform: str = 'windows') -> int:
     parser.add_argument("--task-id", help="数据集任务标识；缺省按任务文本生成")
     parser.add_argument('--mode-prompts-file', help='Studio 保存的各模式决策提示词 JSON')
     args = parser.parse_args()
-    from osworld_agent.prompt_settings import load_mode_prompts
+    from .planning.prompt_settings import load_mode_prompts
     mode_prompts = load_mode_prompts(args.mode_prompts_file)
     if args.result_dir is None:
-        from osworld_agent.workspace_config import allocate_local_result_dir
+        from .runtime.workspace_config import allocate_local_result_dir
         args.result_dir = allocate_local_result_dir()
     if args.run_prefix is None and os.path.basename(os.path.normpath(args.result_dir)) == time.strftime('%Y-%m-%d'):
         import uuid
@@ -389,10 +390,10 @@ def main(platform: str = 'windows') -> int:
     if args.private_completion_spec:
         with open(args.private_completion_spec, encoding="utf-8") as f:
             private_completion_spec = json.load(f)
-    from osworld_agent.verifiers import CompletionVerifier
+    from .verification.verifiers import CompletionVerifier
     task_completion = CompletionVerifier(args.task, completion_spec, private_completion_spec)
-    from osworld_agent.paper_sources import default_paper_start_url
-    from osworld_agent.task_specs import task_profile
+    from .papers.paper_sources import default_paper_start_url
+    from .planning.task_specs import task_profile
     args.browser_start_url = default_paper_start_url(args.task,
         is_paper_download=task_profile(args.task, task_completion.public_spec)['kind'] == 'paper_download',
         browser_start_url=args.browser_start_url)
@@ -416,23 +417,23 @@ def main(platform: str = 'windows') -> int:
         pass  # Early telemetry cannot prevent the browser lifecycle from starting.
     # 1) 启动专用 CDP Chrome；macOS 延后到隔离任务上下文创建可见窗口。
     if platform == 'mac':
-        from osworld_agent.mac_chrome import ensure_chrome as start_chrome, close_test_chrome as stop_chrome
-        from osworld_agent.adapters.mac_env import MacEnvironment as LocalEnvironment
+        from .browser.mac_chrome import ensure_chrome as start_chrome, close_test_chrome as stop_chrome
+        from .adapters.mac_env import MacEnvironment as LocalEnvironment
     else:
         start_chrome, stop_chrome = ensure_chrome, close_test_chrome
         LocalEnvironment = WindowsEnvironment
     from concurrent.futures import ThreadPoolExecutor
-    from osworld_agent.parallel_work import measured_call, prepare_client_dependencies
+    from .runtime.parallel_work import measured_call, prepare_client_dependencies
     # SDK import can take seconds on first use. It needs neither the browser
     # nor credentials; overlap it with Chrome startup, without any generation.
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix='agent-sdk') as pool:
         dependencies = pool.submit(measured_call, prepare_client_dependencies)
         if args.cli_only:
-            from osworld_agent.adapters.cli_env import CLIEnvironment
+            from .adapters.cli_env import CLIEnvironment
             LocalEnvironment = CLIEnvironment
             started_chrome, chrome_profile = False, None
         elif args.browser_session_mode == 'persistent':
-            from osworld_agent.persistent_chrome import ensure_persistent_chrome, close_persistent_chrome
+            from .persistent_chrome import ensure_persistent_chrome, close_persistent_chrome
             started_chrome, chrome_profile = ensure_persistent_chrome(args.browser_port, args.chrome,
                 profile_dir=args.browser_profile_dir, platform=platform)
             stop_chrome = close_persistent_chrome
@@ -464,7 +465,7 @@ def main(platform: str = 'windows') -> int:
             url=args.verifier_url or args.model_url, api_key=args.model_api_key, temperature=0, max_tokens=768,
             timeout=45)) if args.verifier_model or args.verifier_url else None)
         if args.ground_type == "qwen-plus":
-            from osworld_agent.adapters.qwen_grounding import QwenPlusGrounding as ground_cls
+            from .adapters.qwen_grounding import QwenPlusGrounding as ground_cls
         else:
             ground_cls = RealUItarsGrounding if args.ground_type == "ui-tars" else UIVenus2Grounding
         grounding = LoggingGrounding(ground_cls(url=args.ground_url, api_key=args.ground_api_key,
@@ -575,7 +576,7 @@ def main(platform: str = 'windows') -> int:
                      for s in result.trajectory if isinstance(s, dict)]
         with open(os.path.join(args.result_dir, log_name("traj_raw.jsonl")), "w", encoding="utf-8") as _f:
             _f.write("\n".join(raw_lines))
-        from osworld_agent.trajectory import build_trajectory, dump_trajectory
+        from .trajectory import build_trajectory, dump_trajectory
         import hashlib
         task_id = args.task_id or "local-" + hashlib.sha256(args.task.encode()).hexdigest()[:16]
         traj = build_trajectory(task_id=task_id, domain=platform,

@@ -12,6 +12,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from ..actions import Action, BASIC_ACTIONS
+from ..desktop.windows_text import type_unicode
 from ..env import Environment, Observation, StepResult, run_local_command, run_local_python
 from .uno_commands import SET_CELL_VALUES_CMD, SAVE_DOC_CMD
 
@@ -24,7 +25,7 @@ def to_pyautogui(action: Action, *, desktop_origin=None, keyboard_guard=False) -
     writer = 'pyautogui.write'
     guard = 'desktop_input_guard(); ' if keyboard_guard else ''
     if desktop_origin is not None:
-        head += 'from osworld_agent.windows_text import type_unicode; '
+        head += f'from {type_unicode.__module__} import type_unicode; '
         writer = 'type_unicode'
 
     # grounding 失败：拒绝执行（返回空命令 → step() 空转一步），绝不做坐标钳制。
@@ -210,7 +211,7 @@ class VMwareEnvironment(Environment):
         if not host:
             return None
         if self._browser_session is None:
-            from ..browser_session import BrowserSession, BrowserOptions
+            from ..browser.browser_session import BrowserSession, BrowserOptions
             self._browser_session = BrowserSession(
                 options=BrowserOptions(endpoint=f"http://{host}:{port}"),
                 foreground_check=self._focus_is_browser,
@@ -298,7 +299,7 @@ class VMwareEnvironment(Environment):
             if session is not None:
                 shot, snapshot, metadata = session.collect_observation()
                 if shot is not None:
-                    from ..scene import Scene
+                    from ..runtime.scene import Scene
                     metadata["scene"] = Scene(browser_use=1, structure_available=bool(snapshot),
                         mode="browser_dom" if snapshot else "visual", reason="explicit_browser",
                         page_id=metadata.get("page_id", ""), snapshot_id=metadata.get("snapshot_id", "")).to_dict()
@@ -310,7 +311,7 @@ class VMwareEnvironment(Environment):
         if snapshot is None and isinstance(raw_obs, dict):
             text = self._a11y_text(raw_obs)
         from ..model.grounding import screenshot_size
-        from ..scene import Scene
+        from ..runtime.scene import Scene
         size = screenshot_size(screenshot)
         browser_use = surface != "desktop" and (bool(snapshot) or self._focus_is_browser())
         info = {
@@ -363,7 +364,7 @@ class VMwareEnvironment(Environment):
         if not host:
             return False
         try:
-            from ..utils import list_cdp_pages
+            from ..browser.utils import list_cdp_pages
             pages = list_cdp_pages(host, port)
             # 有页面（http 网页 或 chrome:// 设置页，排除 devtools/扩展）就认为在浏览器场景
             return any(
@@ -389,7 +390,7 @@ class VMwareEnvironment(Environment):
         if not host:
             return ""
         try:
-            from .. import utils
+            from ..browser import utils
             # 判断当前页面是不是 WebUI（chrome://settings 等 shadow DOM）。
             # WebUI 里 fetch_interactive_elements（querySelectorAll）只能抓到极少的 light DOM
             # 元素（如一个搜索框），列表不完整会误导模型；必须直接用 AX-Tree（穿透 shadow DOM）。

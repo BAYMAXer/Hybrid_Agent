@@ -10,7 +10,7 @@ from uuid import uuid4
 from PIL import Image
 
 from ..env import Environment, Observation, StepResult
-from ..scene import browser_scene
+from ..runtime.scene import browser_scene
 from .miniwob_actions import SUPPORTED_ACTIONS, translate_action, validate_continuation
 
 

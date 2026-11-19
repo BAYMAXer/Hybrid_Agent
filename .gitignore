@@ -7,6 +7,9 @@ __pycache__/
 .coverage
 htmlcov/
 
+# Generated Jev comparison fixture images
+/comparison/assets/
+
 # Local environments and credentials
 .venv/
 .venv-mac/

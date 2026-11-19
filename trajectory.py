@@ -166,7 +166,7 @@ def dump_trajectory(path: str, trajectory: Dict[str, Any]) -> None:
     """Content-address images，把内嵌 base64 图片外置成 assets/ 下的去重文件。"""
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    from .training_events import externalize_images
+    from .training.training_events import externalize_images
     packed = externalize_images(trajectory, output.parent)
     for step in packed["steps"]:
         if step.get("observation", {}).get("screenshot"):

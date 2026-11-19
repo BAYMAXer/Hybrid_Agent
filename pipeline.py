@@ -16,7 +16,7 @@
 """
 from __future__ import annotations
 
-from .report_delivery import wants_report
+from .reporting.report_delivery import wants_report
 
 import copy
 import os
@@ -39,42 +39,42 @@ from .actions import (
 from .env import Environment, Observation
 from .model import ChatModel, Grounding, resolve_coords, mark_coordinate
 from .model.decision_model import encode_image, ImageEncodingError
-from .scene import scene_hint
+from .runtime.scene import scene_hint
 from .memory import StructuredMemory
 from .skills import SkillContext
 from .prompts import build_format_feedback, build_planner_prompt
-from .context import PromptCompiler, ContextBudgetError, ObservationIncompleteError
-from .verifiers import CompletionVerifier
-from .task_specs import task_profile, task_analysis, audit_requirement_proposals, TASK_ANALYSIS_VERSION
-from .step_progress import ProgressConfig, StepProgressMonitor
+from .planning.context import PromptCompiler, ContextBudgetError, ObservationIncompleteError
+from .verification.verifiers import CompletionVerifier
+from .planning.task_specs import task_profile, task_analysis, audit_requirement_proposals, TASK_ANALYSIS_VERSION
+from .runtime.step_progress import ProgressConfig, StepProgressMonitor
 from .model.decision_judge import DecisionJudge, DecisionJudgeConfig
 from .model.judge_selection import RuntimeDecisionJudge
-from .judge_evidence import effect_review, evidence_fingerprint, checkpoint, target_identity, select_frame
-from .paper_workflow import PaperWorkflow, WORKFLOW_VERSION, binding_group_hash
-from .paper_identity import PaperIdentitySelector
-from .paper_sources import SOURCE_POLICY_VERSION, paper_search_policy
-from .paper_resolver import ADAPTER_VERSION, arxiv_id_from_url
-from .paper_search import PaperSearchRecovery
-from .execution_queue import ExecutionQueue, normalize_verification, MAX_PLAN_STEPS, compile_download_milestones, refine_paper_plan
+from .verification.judge_evidence import effect_review, evidence_fingerprint, checkpoint, target_identity, select_frame
+from .papers.paper_workflow import PaperWorkflow, WORKFLOW_VERSION, binding_group_hash
+from .papers.paper_identity import PaperIdentitySelector
+from .papers.paper_sources import SOURCE_POLICY_VERSION, paper_search_policy
+from .papers.paper_resolver import ADAPTER_VERSION, arxiv_id_from_url
+from .papers.paper_search import PaperSearchRecovery
+from .runtime.execution_queue import ExecutionQueue, normalize_verification, MAX_PLAN_STEPS, compile_download_milestones, refine_paper_plan
 from .decision_context import action_scope, system_sections, selected_memory, current_brief
-from .decision_modes import decision_mode, mode_capability, mode_evidence_key
-from .step_verifier import StepReviewer, code_review, make_review_model, unresolved_desktop_checks
+from .planning.decision_modes import decision_mode, mode_capability, mode_evidence_key
+from .verification.step_verifier import StepReviewer, code_review, make_review_model, unresolved_desktop_checks
 from .actions import BASIC_ACTIONS
-from .browser_feedback import active_paper, paper_action_error, paper_download_preflight_error, redundant_sort_selection_error, search_navigation_error, operational_facts, exposed_nodes, paper_review_error
-from .visual_readiness import is_pdf_observation, content_thumbnail, stable_content, likely_loading_page
-from .pipeline_types import WaitConfig, AgentResult, StepState, Decision, Execution
-from . import pipeline_format
-from .plan_compiler import normalize_plan_actions
-from .phase_timing import timed_phase
-from .parallel_work import measured_call, prepare_model_client
-from .download_review_scope import named_download_receipts
-from .planning_service import PlanningService
-from .settlement import SettlementService, SettlementPorts
-from .review_service import ReviewService, ReviewPorts
-from . import progress_controller
-from .download_click_guard import repeated_download_click_error, remember_unconfirmed_download_click
-from .progress_controller import ProgressController, ProgressPorts
-from .progress_controller import _NO_CHANGE_DIFF_THRESHOLD, _LOOP_HISTORY_LEN, _FAILURE_REPEAT_LIMIT
+from .browser.browser_feedback import active_paper, paper_action_error, paper_download_preflight_error, redundant_sort_selection_error, search_navigation_error, operational_facts, exposed_nodes, paper_review_error
+from .browser.visual_readiness import is_pdf_observation, content_thumbnail, stable_content, likely_loading_page
+from .runtime.pipeline_types import WaitConfig, AgentResult, StepState, Decision, Execution
+from .runtime import pipeline_format
+from .planning.plan_compiler import normalize_plan_actions
+from .runtime.phase_timing import timed_phase
+from .runtime.parallel_work import measured_call, prepare_model_client
+from .verification.download_review_scope import named_download_receipts
+from .planning.planning_service import PlanningService
+from .runtime.settlement import SettlementService, SettlementPorts
+from .verification.review_service import ReviewService, ReviewPorts
+from .runtime import progress_controller
+from .browser.download_click_guard import repeated_download_click_error, remember_unconfirmed_download_click
+from .runtime.progress_controller import ProgressController, ProgressPorts
+from .runtime.progress_controller import _NO_CHANGE_DIFF_THRESHOLD, _LOOP_HISTORY_LEN, _FAILURE_REPEAT_LIMIT
 
 # 实时状态推送（可选）：execute 阶段进度推给 viz 前端，失败不影响主流程
 try:
@@ -111,9 +111,9 @@ class Pipeline:
                  completion_spec=None, context_config=None, private_completion_spec=None,
                  planner_model=None, event_path=None, run_id=None, run_manifest=None, max_replans=3,
                  wait_config=None, verifier_model=None, progress_config=None, decision_judge=None, mode_prompts=None, knowledge_method="all", knowledge_jev_url=""):
-        from .prompt_settings import validate_mode_prompts
+        from .planning.prompt_settings import validate_mode_prompts
         self.mode_prompts = validate_mode_prompts(mode_prompts)
-        from .knowledge_selection import validate_method
+        from .memory.knowledge_selection import validate_method
         self.knowledge_method = validate_method(knowledge_method)
         self.knowledge_jev_url = knowledge_jev_url
         self.model = model
@@ -181,7 +181,7 @@ class Pipeline:
         result = AgentResult(task=task, run_id=self.run_id, run_manifest=manifest,
             private_evaluation={"spec": copy.deepcopy(self.private_completion_spec), "verifier_version": "3.1"})
         if self.event_path:
-            from .training_events import TrainingEventWriter
+            from .training.training_events import TrainingEventWriter
             path = str(self.event_path).replace("{run_id}", self.run_id)
             if Path(path).suffix != ".jsonl":
                 path = str(Path(path) / self.run_id / "events.jsonl")
@@ -215,7 +215,7 @@ class Pipeline:
                 "elapsed_s": elapsed}, elapsed_s=elapsed,
                 goal_bindings=result.run_manifest["goal_bindings"],
                 goal_binding_hash=result.run_manifest["goal_binding_hash"])
-            from .run_metrics import summarize_events
+            from .runtime.run_metrics import summarize_events
             result.run_manifest['run_metrics'] = summarize_events(self.events)
             if _viz_log_status:
                 _viz_log_status({'event': 'run_metrics', 'run_id': self.run_id, 'metrics': result.run_manifest['run_metrics']})
@@ -264,12 +264,69 @@ class Pipeline:
                 "chat_template_revision", "temperature", "max_tokens", "capture_rollout")}
         root = Path(__file__).resolve().parent
         source_hash = hashlib.sha256()
-        for name in ("pipeline.py", "pipeline_types.py", "pipeline_format.py", "plan_compiler.py", "knowledge_base.py", "knowledge_selection.py", "replanning.py", "run_metrics.py",
-                     "model/grounding_usage.py", "model/grounding.py", "adapters/qwen_grounding.py", "adapters/uitars_grounding.py", "adapters/uivenus2_grounding.py",
-                     "planning_service.py", "phase_timing.py", "parallel_work.py", "download_review_scope.py", "report_delivery.py", "report_review.py", "settlement.py", "review_service.py", "progress_controller.py",
-                     "browser_interaction.py", "download_click_guard.py", "browser_profile.py", "persistent_chrome.py", "artifact_download.py", "prompts.py", "context.py", "browser_session.py", "verifiers.py",
-                     "execution_queue.py", "judge_evidence.py", "model/judge_selection.py", "step_verifier.py", "step_progress.py", "decision_context.py", "decision_modes.py", "browser_feedback.py", "paper_search.py", "scholar_search.py", "browser_results.py", "visual_readiness.py", "memory/structured_memory.py", "desktop_state.py", "desktop_readiness.py", "desktop_capture.py", "windows_text.py",
-                     "adapters/windows_env.py", "adapters/vmware_env.py", "task_specs.py", "paper_sources.py", "paper_workflow.py", "paper_identity.py", "paper_resolver.py", "cli_executor.py", "adapters/cli_env.py", "actions.py", "config/action.yaml", "model/decision_model.py", "model/decision_judge.py"):
+        for name in (
+            "pipeline.py",
+            "runtime/pipeline_types.py",
+            "runtime/pipeline_format.py",
+            "planning/plan_compiler.py",
+            "memory/knowledge_base.py",
+            "memory/knowledge_selection.py",
+            "planning/replanning.py",
+            "runtime/run_metrics.py",
+            "model/grounding_usage.py",
+            "model/grounding.py",
+            "adapters/qwen_grounding.py",
+            "adapters/uitars_grounding.py",
+            "adapters/uivenus2_grounding.py",
+            "planning/planning_service.py",
+            "runtime/phase_timing.py",
+            "runtime/parallel_work.py",
+            "verification/download_review_scope.py",
+            "reporting/report_delivery.py",
+            "reporting/report_review.py",
+            "runtime/settlement.py",
+            "verification/review_service.py",
+            "runtime/progress_controller.py",
+            "browser/browser_interaction.py",
+            "browser/download_click_guard.py",
+            "browser/browser_profile.py",
+            "persistent_chrome.py",
+            "verification/artifact_download.py",
+            "prompts.py",
+            "planning/context.py",
+            "browser/browser_session.py",
+            "verification/verifiers.py",
+            "runtime/execution_queue.py",
+            "verification/judge_evidence.py",
+            "model/judge_selection.py",
+            "verification/step_verifier.py",
+            "runtime/step_progress.py",
+            "decision_context.py",
+            "planning/decision_modes.py",
+            "browser/browser_feedback.py",
+            "papers/paper_search.py",
+            "papers/scholar_search.py",
+            "browser/browser_results.py",
+            "browser/visual_readiness.py",
+            "memory/structured_memory.py",
+            "desktop/desktop_state.py",
+            "desktop/desktop_readiness.py",
+            "desktop/desktop_capture.py",
+            "desktop/windows_text.py",
+            "adapters/windows_env.py",
+            "adapters/vmware_env.py",
+            "planning/task_specs.py",
+            "papers/paper_sources.py",
+            "papers/paper_workflow.py",
+            "papers/paper_identity.py",
+            "papers/paper_resolver.py",
+            "runtime/cli_executor.py",
+            "adapters/cli_env.py",
+            "actions.py",
+            "config/action.yaml",
+            "model/decision_model.py",
+            "model/decision_judge.py",
+        ):
             source_hash.update(name.encode())
             source_hash.update((root / name).read_bytes())
         manifest = {"run_id": self.run_id, "task": task, "framework_source_hash": source_hash.hexdigest(),
@@ -354,7 +411,7 @@ class Pipeline:
             workspace = self.env.prepare_workspace(self.run_id)
             result.run_manifest['workspace'] = copy.deepcopy(workspace)
             self._publish_diagnostic('workspace_ready', workspace=workspace)
-        from .cli_executor import cli_capability
+        from .runtime.cli_executor import cli_capability
         if not hasattr(self.env, 'initial_state'):
             self.env.initial_state = {}
         self.env.initial_state['cli_capability'] = cli_capability(self.env)
@@ -591,11 +648,11 @@ class Pipeline:
         if state.obs is None:
             state.obs = self.env.reset(state.task)
             self._set_download_deadline()
-        from .cli_executor import cli_capability
+        from .runtime.cli_executor import cli_capability
         state.obs.info['cli_capability'] = cli_capability(self.env)
         if getattr(mode_capability(state.obs, state.queue.current if state.queue else None), 'mode', None) != 'cli':
             state.obs = self._settle_rendering(Execution(kind="env", obs=state.obs), state).obs
-        from .report_delivery import collect_sources
+        from .reporting.report_delivery import collect_sources
         collect_sources(state)
         self.completion.observe(state.obs)
         state.verification = self.completion.evaluate()
@@ -640,7 +697,7 @@ class Pipeline:
         page-density heuristics silently control a different next action.
         """
         current = state.queue.current if state.queue else None
-        from .cli_executor import cli_capability
+        from .runtime.cli_executor import cli_capability
         if state.obs is not None:
             state.obs.info['cli_capability'] = cli_capability(self.env)
         hard = mode_capability(state.obs, current)
@@ -897,7 +954,7 @@ class Pipeline:
             return None
         if action.args.get('target_ref') or action.args.get('element_id'):
             return None
-        from .scene import observation_scene
+        from .runtime.scene import observation_scene
         selected_mode = ((state.obs.info or {}).get('decision_mode') or {}).get('mode') if state.obs else None
         if ((selected_mode == 'gui' or (selected_mode is None and observation_scene(state.obs).get('mode') == 'browser_gui'))
                 and action.action in {'click', 'double_click', 'right_click', 'type'}):
@@ -907,7 +964,7 @@ class Pipeline:
         # Explicit refs and semantic DOM routing still work in ground().
         if is_pdf_observation(state.obs):
             return None
-        from .browser_session import INTERACTIVE
+        from .browser.browser_session import INTERACTIVE
         nodes = [n for n in exposed_nodes(state.obs)
                  if n.get('direct') and n.get('role') in INTERACTIVE
                  and not n.get('states', {}).get('disabled')]
@@ -994,7 +1051,7 @@ class Pipeline:
         try:
             obs = self.env.observe()
             if obs is not None:
-                from .cli_executor import cli_capability
+                from .runtime.cli_executor import cli_capability
                 obs.info["cli_capability"] = cli_capability(self.env)
                 if getattr(self, "_last_cli_result", None):
                     obs.info["cli_result"] = copy.deepcopy(self._last_cli_result)
@@ -1076,7 +1133,7 @@ class Pipeline:
             return Execution(kind="rejected", executed="rejected", obs=state.obs,
                 info={"status": "rejected", "dispatched": False, "error_code": "non_basic_action"})
         if name == 'cli':
-            from .cli_executor import execute_cli
+            from .runtime.cli_executor import execute_cli
             self._publish_diagnostic('cli_execution', status='running', action=self._compact_action(action))
             info = execute_cli(self.env, action.args, remaining_s=self._task_time_remaining())
             session = getattr(self.env, '_browser_session', None)
@@ -1446,7 +1503,7 @@ class Pipeline:
         before_screenshot = state.screenshot_history[-1] if state.screenshot_history else None
         if execution.obs is not None:
             state.obs = execution.obs
-        from .report_delivery import collect_sources, wants_report
+        from .reporting.report_delivery import collect_sources, wants_report
         collect_sources(state)
         if wants_report(state.task) and (execution.kind == 'finish_request' or
                 (state.queue and (state.queue.current or {}).get('phase') == 'report')):
@@ -1669,8 +1726,8 @@ class Pipeline:
         """Delegate planning; retain one owner for queue and memory installation."""
         if not repair:
             self.planning_calls = []
-            from .knowledge_base import load_knowledge
-            from .knowledge_selection import select_knowledge, configure_selection_transport
+            from .memory.knowledge_base import load_knowledge
+            from .memory.knowledge_selection import select_knowledge, configure_selection_transport
             selection_model = selection_judge = None
             snapshot = None
             started = time.perf_counter()
@@ -1799,7 +1856,7 @@ class Pipeline:
             recheck_jev=self._recheck_jev, publish_review=self._publish_review, record_call=self._record_call))
 
     def _code_step_review(self, state, step, execution_info, allow_contract=True):
-        from .cli_executor import file_check_samples
+        from .runtime.cli_executor import file_check_samples
         if state.obs is not None:
             state.obs.info['cli_checks'] = file_check_samples(self.env, step.get('verification', []), self._task_time_remaining)
         return self._review_service()._code_step_review(state, step, execution_info, allow_contract)
@@ -2157,7 +2214,7 @@ class Pipeline:
         # files may intentionally be renamed/removed by later steps.
         steps = (getattr(state.memory, 'plan', None) or {}).get('steps', [])
         predicates = []
-        from .cli_executor import cli_capability
+        from .runtime.cli_executor import cli_capability
         cap = cli_capability(self.env)
         relocations = getattr(self, '_cli_relocations', {})
         for item in steps:
@@ -2185,7 +2242,7 @@ class Pipeline:
                     ('presence' if p['kind'] in {'file_exists', 'file_absent'} else p['kind']) == family)]
                 predicates.append(predicate)
         if predicates and state.obs is not None:
-            from .cli_executor import file_check_samples
+            from .runtime.cli_executor import file_check_samples
             state.obs.info['cli_checks'] = file_check_samples(self.env, predicates, self._task_time_remaining)
             file_report = code_review({'verification': predicates}, state.obs, {}, {})
             code['file_checks'] = file_report['checks']
@@ -2205,7 +2262,7 @@ class Pipeline:
             for item in (getattr(state.memory, 'plan', None) or {}).get('steps', [])
             for p in item.get('verification', []) if p.get('kind') == 'artifact_download'}
         if formats:
-            from .artifact_download import verified_download
+            from .verification.artifact_download import verified_download
             valid = [f for f in state.download_facts if f.get('status') == 'passed']
             code['download_checks'] = []
             for fmt in sorted(formats):
@@ -2243,7 +2300,7 @@ class Pipeline:
 
     @timed_phase("final_review")
     def _verify_finish(self, state: StepState, answer: str) -> Tuple[bool, str]:
-        from .report_delivery import wants_report
+        from .reporting.report_delivery import wants_report
         report_required = wants_report(state.task)
         if report_required and state.report_delivery.get('status') != 'complete':
             return False, '信息整理结果尚未生成完成，不能验收通过'
@@ -2267,7 +2324,7 @@ class Pipeline:
                 self._reviewed_download_facts, state.download_facts):
             self._model_final_report = None
             return False, '已接受验收所依据的下载文件丢失或改变，原成功结论失效'
-        from .report_review import text_only_task, delivery_digest
+        from .reporting.report_review import text_only_task, delivery_digest
         text_review = report_required and text_only_task(state.task, code)
         fingerprint = (delivery_digest(state.task, state.report_delivery) if text_review else
                        self._finish_evidence_fingerprint(state.obs, state.download_facts))
@@ -2317,7 +2374,7 @@ class Pipeline:
         return reviewed["status"] == "passed", reviewed["reason"]
 
     def _ensure_report(self, state):
-        from .report_delivery import generate_report
+        from .reporting.report_delivery import generate_report
         state.report_delivery = generate_report(state, self.model, self._publish_diagnostic,
             self._record_call, self._task_time_remaining)
         self._report_delivery = state.report_delivery
@@ -2586,7 +2643,7 @@ class Pipeline:
                 # Observe again after callbacks; revoke/review if visible evidence changed.
                 state = self._reviewed_state
                 if model_report.get('review_scope') == 'text_report':
-                    from .report_review import delivery_digest
+                    from .reporting.report_review import delivery_digest
                     if delivery_digest(state.task, state.report_delivery) != model_report.get('evidence_digest'):
                         confirmed, _ = self._verify_finish(state, "")
                         model_report = self._model_final_report if confirmed else None
