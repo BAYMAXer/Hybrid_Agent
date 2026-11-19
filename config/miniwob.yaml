@@ -1,0 +1,24 @@
+# Default configuration for python -m hybrid_agent.adapters.run_miniwob.
+# Model names/URLs/keys are read from the shell where the batch is launched.
+model:
+  name: env:MINIWOB_MODEL_NAME
+  url: env:MINIWOB_MODEL_URL
+  api_key: env:MINIWOB_MODEL_API_KEY
+  temperature: 0.0
+  max_tokens: 2048
+  vision: true
+  disable_thinking: false
+
+grounding_model:
+  name: ui_venus2_9b
+  url: env:MINIWOB_GROUND_URL
+  api_key: env:MINIWOB_GROUND_API_KEY
+
+# The planner and verifier reuse the decision endpoint by default.
+# MiniWoB++ owns its webpage timer independently of this agent budget.
+agent:
+  max_steps: 40
+  max_retries: 3
+  max_replans: 3
+  wait_config:
+    task_timeout_s: 180

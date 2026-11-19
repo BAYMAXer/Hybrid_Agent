@@ -1,0 +1,165 @@
+# =============================================================
+# 动作注册表 —— 决策模型可以输出的所有动作
+# =============================================================
+# 每个动作一个条目，字段说明：
+#   params:       必填参数列表（模型输出 JSON 的 args 里必须包含这些键）
+#   description:  中文描述，会原样写进 system prompt 给模型看
+#   kind:         执行方式：
+#                   env      —— 交给环境执行（可带坐标定位）
+#                   browser  —— 浏览器操作（DOM 定位，走 CDP，不经视觉定位模型）
+#                   terminal —— 终止动作（done / fail），结束整个任务
+#   resolve:      （仅 kind=env 需要）坐标解析方式：
+#                   none   —— 不需要定位坐标
+#                   point  —— target 描述 -> 一个坐标 (x, y)
+#                   select —— target 描述 -> 坐标 (x, y) + 保留 option
+#                   drag   —— from_target / to_target -> 两个坐标 (x1,y1,x2,y2)
+# =============================================================
+
+actions:
+  cli:
+    kind: cli
+    resolve: none
+    params: [operation]
+    description: "后台文件/终端操作。operation=list/stat/read/write/mkdir/copy/move/rename/open/shell/compare；文件操作带path，copy/move/rename另带destination，write带content，shell带command。可选cwd、timeout_s(1~120)、overwrite(默认false)。相对路径基于默认工程目录。"
+
+  click:
+    params: [target]
+    description: "点击某个元素。优先用 DOM 定位：若 browser_ax 里该元素带 id，加可选参数 element_id（直接复制该 HTML id）；若带 ref，加可选参数 target_ref（复制完整 ref）。两者都走 DOM 确定性定位、无需视觉定位模型。找不到 id/ref 时，target 用英文描述整个元素，程序会退回视觉定位模型定位坐标"
+    kind: env
+    resolve: point
+
+  double_click:
+    params: [target]
+    description: "双击某个元素"
+    kind: env
+    resolve: point
+
+  right_click:
+    params: [target]
+    description: "右键点击某个元素"
+    kind: env
+    resolve: point
+
+  type:
+    params: [target, text]
+    # Optional submit_key: Enter, only with overwrite: true and a current DOM
+    # reference. Executor validates a single-line text/search input and focus,
+    # records both primitive inputs, and reviews their combined result once.
+    description: "点击并聚焦目标输入框/区域（target），然后输入文字（text）。默认是【追加】到光标处；若要【覆盖】原有内容（修改已有值，如把 80 改成 50），加可选参数 overwrite: true，会先清空原内容再输入新文字。优先用 DOM 定位：加可选参数 element_id（HTML id）或 target_ref（完整 ref）直接引用，走 DOM 确定性定位；都找不到时用英文 target 走视觉定位"
+    kind: env
+    resolve: point
+
+  scroll:
+    params: [direction, amount]
+    description: "滚动页面（direction=up/down，amount=滚动格数）"
+    kind: env
+    resolve: none
+
+  press:
+    params: [key]
+    description: "按单个键（key），如 Enter / Tab / Esc / backspace（退格删除前一个字符）/ delete（删除后一个字符）/ 方向键"
+    kind: env
+    resolve: none
+
+  hotkey:
+    params: [keys]
+    description: "按组合键（keys 是列表，如 [\"ctrl\",\"c\"]）"
+    kind: env
+    resolve: none
+
+  goto:
+    params: [url]
+    description: "浏览器打开网址（url）"
+    kind: env
+    resolve: none
+
+  select:
+    params: [target, option]
+    description: "在下拉框里选一项（target=下拉框描述，option=要选的选项文字）。优先用 DOM 定位：加可选参数 element_id（HTML id）或 target_ref（完整 ref）直接引用，走 DOM 确定性定位；都找不到时用英文 target 走视觉定位"
+    kind: env
+    resolve: select
+
+  drag_and_drop:
+    params: [from_target, to_target]
+    description: "把元素 A 拖到元素 B（from_target=起点元素描述，to_target=终点元素描述）"
+    kind: env
+    resolve: drag
+
+  switch_applications:
+    params: [app_code]
+    description: "激活已打开的目标应用窗口；Windows 支持 app_code=file_explorer/chrome 或进程名。未打开时请用系统启动器或快捷键；不支持精确切换的环境会明确拒绝"
+    kind: env
+    resolve: none
+
+  wait:
+    params: [seconds]
+    description: "等待若干秒（seconds）"
+    kind: env
+    resolve: none
+
+  get_page_source:
+    params: []
+    description: "按需读取当前浏览器页面的精简 DOM（脚本/样式/隐藏字段已剔除），可加可选参数 target_ref 只读该节点。只在 AX 信息不足时使用"
+    kind: browser
+    resolve: none
+
+  run_browser_js:
+    params: [js]
+    description: "在任务浏览器里执行一段 JavaScript 代码（js 是函数体，可用 return 返回数据，或只做副作用如点击选项/填值/读题）。用于需要注入 JS 的场景，如 ilearning 考试自动读题、自动点选答案、轮询进度。可加可选参数 max_chars 限制返回长度"
+    kind: browser
+    resolve: none
+
+  handle_dialog:
+    params: [accept]
+    description: "处理观察中报告的 JavaScript 对话框，accept 为 true/false；prompt 可加 prompt_text，多弹窗时指定 dialog_id"
+    kind: browser
+    resolve: none
+
+  list_tabs:
+    params: []
+    description: "列出当前任务浏览器的标签页及 tab_id，新弹窗不会自动接管当前任务页"
+    kind: browser
+    resolve: none
+
+  switch_tab:
+    params: [tab_id]
+    description: "切换到观察中已存在的 tab_id 标签页"
+    kind: browser
+    resolve: none
+
+  close_tab:
+    params: []
+    description: "关闭当前标签页并回到其父页，可选 tab_id 关闭指定任务标签页"
+    kind: browser
+    resolve: none
+
+  observe_desktop:
+    params: []
+    description: "切到桌面截图和桌面操作面，用于浏览器工具栏、权限气泡或系统文件对话框"
+    kind: browser
+    resolve: none
+
+  observe_browser:
+    params: []
+    description: "切回网页截图、AX 树和页面坐标操作面"
+    kind: browser
+    resolve: none
+
+  # ---- 终止动作 ----
+  request_finish:
+    params: [answer]
+    description: "请求结束任务并给出最终答案（answer 直接写找到的结果）；程序会验证是否真的完成，未完成会被拒绝"
+    kind: terminal
+    resolve: none
+
+  fail:
+    params: []
+    description: "任务无法完成（目标功能已不存在 / 资源不可达），放弃并结束"
+    kind: terminal
+    resolve: none
+
+
+# =============================================================
+# 扩展需同时经 actions.BASIC_ACTIONS 登记；CLI 仅由绑定目标机的执行器派发。
+# =============================================================
+extra_actions: {}

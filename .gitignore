@@ -1,0 +1,44 @@
+# Python caches and generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local environments and credentials
+.venv/
+.venv-mac/
+.venv312/
+venv/
+viz/studio_settings.json
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Local logs and run output
+*.log
+logs/
+runs/
+local_runs/
+outputs/
+workspace/
+downloads/
+human_runs/
+
+# Editor and operating system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local diagnostics and exported conversations
+.runtime/
+_session*
+*.pending-update
+
+# Unused local UI/server snapshots
+viz/server_old.py
+viz/static/index_old.html
