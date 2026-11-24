@@ -5,6 +5,14 @@ import re
 import time
 
 
+_CORE_WINDOW = 'Windows.UI.Core.CoreWindow'
+_SHELL_PROCESSES = {
+    'startmenuexperiencehost.exe': 'start_menu',
+    'searchhost.exe': 'search',
+    'searchapp.exe': 'search',
+}
+
+
 def windows_runtime_state(*, include_layout=False):
     if sys.platform != "win32":
         return {"applications": [], "complete": False}
@@ -32,8 +40,10 @@ def windows_runtime_state(*, include_layout=False):
         kernel.CloseHandle.argtypes = [wintypes.HANDLE]
         apps, errors, layout = [], [], []
 
-        @callback_type
-        def visit(hwnd, _):
+        system_root = os.environ.get('SystemRoot') or os.environ.get('WINDIR')
+        system_apps = os.path.normcase(os.path.join(system_root, 'SystemApps', '')) if system_root else None
+
+        def collect(hwnd, enumerated, *, shell_only=False):
             handle = None
             try:
                 if not user.IsWindowVisible(hwnd):
@@ -48,10 +58,9 @@ def windows_runtime_state(*, include_layout=False):
                 cloak_ok = dwm.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked)) == 0
                 if include_layout and cloak_ok and cloaked.value:
                     return True
-                if include_layout and bounds and not user.IsIconic(hwnd) and not cloaked.value:
+                if enumerated and include_layout and bounds and not user.IsIconic(hwnd) and not cloaked.value:
                     layout.append((int(hwnd), tuple(bounds)))
-                if not title.value and not (hwnd == foreground and class_name.value in
-                                            {'Progman', 'WorkerW', 'Shell_TrayWnd', 'Shell_SecondaryTrayWnd'}):
+                if not title.value and hwnd != foreground and not shell_only:
                     return True
                 pid = wintypes.DWORD()
                 user.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
@@ -61,11 +70,21 @@ def windows_runtime_state(*, include_layout=False):
                 if not handle or not kernel.QueryFullProcessImageNameW(handle, 0, path, ctypes.byref(length)):
                     errors.append(True)
                     return True
-                apps.append({"process_name": os.path.basename(path.value), "pid": pid.value, "title": title.value,
+                process_name = os.path.basename(path.value)
+                surface = (_SHELL_PROCESSES.get(process_name.casefold())
+                           if system_apps and class_name.value == _CORE_WINDOW and os.path.normcase(path.value).startswith(system_apps)
+                           else None)
+                if shell_only and not surface:
+                    return True
+                if not title.value and not surface and class_name.value not in {
+                        'Progman', 'WorkerW', 'Shell_TrayWnd', 'Shell_SecondaryTrayWnd'}:
+                    return True
+                apps.append({"process_name": process_name, "pid": pid.value, "title": title.value,
                              "hwnd": int(hwnd), "class_name": class_name.value, "foreground": hwnd == foreground,
                              "bounds": bounds, "visible": True, "minimized": bool(user.IsIconic(hwnd)),
                              "enabled": bool(user.IsWindowEnabled(hwnd)), "responsive": not bool(user.IsHungAppWindow(hwnd)),
-                             "cloaked": bool(cloaked.value) if cloak_ok else None})
+                             "cloaked": bool(cloaked.value) if cloak_ok else None,
+                             **({"shell_surface": surface} if surface else {})})
             except Exception:
                 errors.append(True)
             finally:
@@ -73,12 +92,38 @@ def windows_runtime_state(*, include_layout=False):
                     kernel.CloseHandle(handle)
             return True
 
+        @callback_type
+        def visit(hwnd, _):
+            return collect(hwnd, enumerated=True)
+
+        def read_windows():
+            enumerated = bool(user.EnumWindows(visit, 0))
+            # EnumWindows only includes desktop apps on Windows 8+. Read the
+            # actual input HWND as well, without guessing its place in z order.
+            if foreground and not any(window['hwnd'] == foreground for window in apps):
+                collect(foreground, enumerated=False)
+            if include_layout and any(w.get('shell_surface') and w['foreground'] for w in apps):
+                # Search can hold keyboard focus while Start owns the visible
+                # pinned app. Both CoreWindows can be absent from EnumWindows.
+                user.FindWindowExW.argtypes = [wintypes.HWND, wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR]
+                user.FindWindowExW.restype = wintypes.HWND
+                known = {window['hwnd'] for window in apps}
+                seen, hwnd = set(), None
+                while (hwnd := user.FindWindowExW(None, hwnd, _CORE_WINDOW, None)) and hwnd not in seen:
+                    seen.add(hwnd)
+                    if hwnd not in known:
+                        collect(hwnd, enumerated=False, shell_only=True)
+            if user.GetForegroundWindow() != foreground:
+                for window in apps:
+                    window['foreground'] = False
+            return enumerated and not errors
+
         if include_layout:
             from .desktop_capture import physical_dpi_context
             with physical_dpi_context():
-                complete = bool(user.EnumWindows(visit, 0)) and not errors
+                complete = read_windows()
         else:
-            complete = bool(user.EnumWindows(visit, 0)) and not errors
+            complete = read_windows()
         return {"applications": apps, "complete": complete, "source": "windows_window_api",
                 **({"_window_layout": layout} if include_layout else {})}
     except Exception:
@@ -106,7 +151,15 @@ def windows_application_process(app_code):
     return None
 
 
-def pointer_guard(action, origin, browser_handles, layouts, *, leaving_browser=False):
+def shell_pointer_windows(runtime):
+    """Comparable identities of ready Start/Search surfaces around a screenshot."""
+    from .desktop_readiness import window_ready
+    return {(w['hwnd'], w['pid'], w['process_name'], w['class_name'], w['title'], tuple(w['bounds']))
+            for w in runtime.get('applications', [])
+            if w.get('shell_surface') and window_ready(w, require_foreground=False)}
+
+
+def pointer_guard(action, origin, browser_handles, layouts, *, leaving_browser=False, shell_handles=None):
     """Recheck local window geometry at the gesture points, including background windows."""
     if sys.platform != 'win32':
         return ""
@@ -134,6 +187,8 @@ def pointer_guard(action, origin, browser_handles, layouts, *, leaving_browser=F
             owner = user.GetAncestor(user.WindowFromPoint(p), 2)
             if owner in browser_handles or (leaving_browser and not owner):
                 return "browser_task_out_of_scope"
+            if shell_handles is not None and owner not in shell_handles:
+                return "desktop_shell_target_changed"
             if layouts and not stable_point_layout((p.x, p.y), layouts, owner=owner):
                 return "desktop_window_geometry_changed"
     return "browser_task_out_of_scope" if leaving_browser and not points else ""

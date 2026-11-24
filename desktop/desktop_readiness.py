@@ -16,12 +16,12 @@ def window_identity(window):
     return tuple((window or {}).get(k) for k in ('hwnd', 'pid', 'process_name'))
 
 
-def window_ready(window):
+def window_ready(window, *, require_foreground=True):
     """OS readiness only; it does not prove that folder contents have loaded."""
     if not window or not window.get('hwnd') or not window.get('pid'):
         return False
     bounds = window.get('bounds')
-    return (window.get('visible') is True and window.get('foreground') is True
+    return (window.get('visible') is True and (not require_foreground or window.get('foreground') is True)
             and window.get('minimized') is False and window.get('cloaked') is False
             and window.get('enabled') is True and window.get('responsive') is True
             and isinstance(bounds, (list, tuple)) and len(bounds) == 4

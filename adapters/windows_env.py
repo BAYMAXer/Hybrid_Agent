@@ -40,6 +40,7 @@ class WindowsEnvironment(Environment):
         self._desktop_stop = None
         self._desktop_lease = None
         self._captured_layouts = ()
+        self._captured_shell_windows = set()
         self._desktop_intent_task = None
         self._protect_new_file = False
         self._allowed_existing_names = set()
@@ -105,6 +106,7 @@ class WindowsEnvironment(Environment):
                 self._desktop_capture = {}
                 self._last_observation_info = {}
                 self._captured_layouts = ()
+                self._captured_shell_windows.clear()
                 self._pending_window = self._last_window_wait = None
                 self._window_launch_inflight = False
                 self._window_wait_cancel.clear()
@@ -202,6 +204,7 @@ class WindowsEnvironment(Environment):
     def _inactive_observation(self):
         self._desktop_capture = {}
         self._captured_layouts = ()
+        self._captured_shell_windows.clear()
         if self._desktop_ax:
             self._desktop_ax.invalidate()
         self._last_observation_info = {"task_mode": "desktop", "active_surface":"desktop",
@@ -350,10 +353,11 @@ class WindowsEnvironment(Environment):
             info['desktop_focus_stable'] = bool(before and after and window_identity(before) == window_identity(after))
             if self.task_mode == "desktop":
                 from ..desktop.hcu_ax import browser_window
-                from ..desktop.desktop_state import common_file_dialog
+                from ..desktop.desktop_state import common_file_dialog, shell_pointer_windows
                 self._captured_layouts = tuple(layout for layout in (
                     desktop_before.pop("_window_layout", None), info["runtime_state"].pop("_window_layout", None))
                     if layout is not None)
+                self._captured_shell_windows = shell_pointer_windows(desktop_before) & shell_pointer_windows(info['runtime_state'])
                 info['control_mode'] = 'desktop'
                 info['desktop_browser_foreground'] = browser_window(after)
                 info['desktop_focus_stable'] = bool(info['desktop_focus_stable'] and before.get("title") == after.get("title"))
@@ -626,22 +630,29 @@ class WindowsEnvironment(Environment):
                 if (not self._last_observation_info.get("desktop_focus_stable") or not current or
                         window_identity(current) != window_identity(previous) or current.get("title") != previous.get("title")):
                     return StepResult(self.observe(), info={"status": "rejected", "dispatched": False,
-                                      "error_code": "desktop_focus_changed", "channel": "desktop"})
+                                      "error_code": "desktop_focus_changed", "channel": "desktop",
+                                      "reason": "未能确认截图与当前输入属于同一前台窗口，请重新观察桌面"})
                 if name in {"click", "double_click", "right_click", "drag_and_drop", "type", "select", "scroll"}:
-                    from ..desktop.desktop_state import pointer_guard
+                    from ..desktop.desktop_state import pointer_guard, shell_pointer_windows
                     browser_handles = {w["hwnd"] for w in current_state.get("applications", []) if w.get("hwnd") and browser_window(w)}
+                    shell_handles = None
+                    if current.get('shell_surface'):
+                        stable_shell = self._captured_shell_windows & shell_pointer_windows(current_state)
+                        shell_handles = {identity[0] for identity in stable_shell}
                     try:
                         if self._captured_layouts and "_window_layout" not in current_state:
                             raise OSError("无法核实目标窗口位置")
                         layouts = (*self._captured_layouts, current_state["_window_layout"]) if "_window_layout" in current_state else ()
                         guard_error = pointer_guard(action, self._desktop_capture.get("screen_origin", [0, 0]), browser_handles,
-                                                    layouts, leaving_browser=leaving_browser)
+                                                    layouts, leaving_browser=leaving_browser, shell_handles=shell_handles)
                     except OSError:
                         return StepResult(self.observe(), info={"status": "rejected", "dispatched": False,
                                           "error_code": "desktop_pointer_unconfirmed", "channel": "desktop"})
                     if guard_error:
                         return StepResult(self.observe(), info={"status": "rejected", "dispatched": False,
-                                          "error_code": guard_error, "channel": "desktop"})
+                                          "error_code": guard_error, "channel": "desktop",
+                                          **({"reason": "鼠标落点不属于截图中已确认的开始菜单或搜索窗口，请重新观察"}
+                                             if guard_error == "desktop_shell_target_changed" else {})})
         if name in {"observe_desktop", "observe_browser"}:
             self._observation_surface = "desktop" if name == "observe_desktop" else "browser"
             obs = self.observe()
@@ -763,8 +774,19 @@ class WindowsEnvironment(Environment):
                 self._window_launch_inflight = True
                 result = self._wait_for_desktop_window(target, dispatched=True)
                 return StepResult(observation=self.observe(), info=result)
-            return StepResult(observation=self.observe(), info={
-                "status": "executed", "dispatched": True, "channel": "desktop"})
+            after = self.observe()
+            receipt = {"status": "executed", "dispatched": True, "channel": "desktop"}
+            if self.task_mode == 'desktop' and name == 'hotkey':
+                keys = [str(key).casefold() for key in action.args.get('keys', [])]
+                if len(keys) == 2 and keys[0] in {'win', 'winleft', 'winright'} and keys[1] == 'r':
+                    from ..desktop.desktop_readiness import foreground
+                    before_window = foreground(observed.get('runtime_state', {})) or {}
+                    after_window = foreground(after.info.get('runtime_state', {})) or {}
+                    if (observed.get('desktop_focus_stable') and before_window.get('shell_surface')
+                            and after.info.get('desktop_focus_stable') and after_window.get('shell_surface')):
+                        receipt.update(status='uncertain', error_code='run_dialog_not_confirmed',
+                                       reason='Win+R 已派发，尚未确认“运行”对话框，前台仍是开始菜单或搜索。请重新观察，若菜单仍在，按 Esc 关闭后再按 Win+R。')
+            return StepResult(observation=after, info=receipt)
         return StepResult(observation=self.observe(), info={
             "status": "rejected", "dispatched": False, "channel": "desktop",
             "error": "unsupported action or invalid coordinates"})
@@ -836,6 +858,7 @@ class WindowsEnvironment(Environment):
                 self._desktop_ax = None
                 self._desktop_capture = {}
                 self._captured_layouts = ()
+                self._captured_shell_windows.clear()
                 self._last_observation_info = {}
                 self._episode_prepared = False
                 if self._desktop_lease is not None:
