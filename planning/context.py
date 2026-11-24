@@ -82,7 +82,7 @@ def _control_relationships(nodes):
 
 
 class PromptCompiler:
-    version = "2.3"
+    version = "2.4"
 
     def __init__(self, config=None):
         self.config = config or ContextConfig()
@@ -118,6 +118,38 @@ class PromptCompiler:
         query_terms = set(re.findall(r"[\w\u4e00-\u9fff]+", query.lower()))
         remaining = budget
         for block in blocks:
+            if block.get("kind") == "desktop_ax":
+                header = {k: block[k] for k in ("kind", "window_ref", "snapshot_id", "title") if k in block}
+                rows = [json.dumps(header, ensure_ascii=False, separators=(",", ":"))]
+                used = self.count(rows[0])
+                if used > remaining:
+                    continue
+                nodes = block.get("nodes", [])
+                # Keep current edits visible alongside target controls in large native trees.
+                query_text = query.casefold()
+                def priority(node):
+                    name = str(node.get("name") or "").strip().casefold()
+                    value = str(node.get("value") or "").strip().casefold()
+                    focused = str((node.get("states") or {}).get("focused", "")).casefold() == "true"
+                    return (focused, bool(value and value in query_text), bool(name and name in query_text),
+                            bool(node.get("direct")))
+                selected = 0
+                for node in sorted(nodes, key=priority, reverse=True):
+                    fields = {k: node[k] for k in ("ref", "role", "name", "value", "states", "actions", "direct")
+                              if k in node and node[k] not in (None, "", [], {})}
+                    row = json.dumps(fields, ensure_ascii=False, separators=(",", ":"))
+                    cost = self.count(row + "\n")
+                    if cost > remaining - used:
+                        continue
+                    rows.append(row)
+                    used += cost
+                    selected += 1
+                    if node.get("ref") and node.get("direct"):
+                        exposed.append(node["ref"])
+                sections.append("\n".join(rows))
+                remaining -= used
+                metadata.append({"snapshot_id": block.get("snapshot_id"), "total": len(nodes), "selected": selected})
+                continue
             if block.get("kind") != "browser_ax":
                 rendered = self.clip(str(block.get("text", "")), remaining)
                 sections.append(rendered)

@@ -34,9 +34,32 @@ class PlanningService:
         block so installation failures follow the existing planning error path.
         verification_feedback is the original public_report used for replanning.
         """
+        desktop = state.task_profile.get('kind') == 'desktop'
         prompt = build_planner_prompt(task, public_spec, state.task_profile)
         from ..reporting.report_delivery import wants_report
-        if wants_report(task):
+        if desktop:
+            from ..desktop.desktop_readiness import foreground
+            info = state.obs.info if state.obs else {}
+            window = foreground(info.get("runtime_state") or {}) or {}
+            prompt = ("为 Windows 原生桌面任务制定可观察的结果计划。用户任务：" + task +
+                      "\n当前前台：" + json.dumps({k:window.get(k) for k in ('process_name','title','class_name')}, ensure_ascii=False) +
+                      "\nAX 可用时可按当前控件引用执行；截图和键鼠可用于其他可见操作。可以跨原生应用，浏览器与混合任务不在本版范围。"
+                      "\n输出一个 JSON 对象含 steps。每步给出非空 goal、expected_evidence、verification 数组。缺少代码条件时用 [{\"kind\":\"visual\"}]。"
+                      "可用 app_ready/app_foreground(app)、file_exists/file_absent(path)、file_content(path,text)、files_equal(path,other_path)。"
+                      "file_content 核对普通文本或 DOCX/XLSX 的逻辑文本，指定单元格等精确条件使用已有公开检查。"
+                      "图片等二进制交付用 file_exists 配合实际可见效果核查。"
+                      "app 字段为真实 Windows 进程名。指定应用时必须实际操作该应用，不能用命令行替代；单独文件/终端任务可给 actions:[\"cli\"]。"
+                      "启动应用、输入和保存可合并成可核查的自然里程碑。用户要求的文件内容、格式、路径要写明，保存结果给出文件回读谓词。"
+                      "file_exists 同时指定 file_type=file 或 directory。步骤内临时文件谓词加 scope=milestone；最终交付文件使用 scope=final。"
+                      "保留原任务交付与操作要求，只允许引用以下公开检查 ID：" +
+                      json.dumps(public_spec.get('checks', []), ensure_ascii=False))
+            if wants_report(task, desktop=True):
+                prompt += "\n需要交付文字答案时，先收集可核实的桌面或文件来源，最后单独安排 phase=report，verification 使用 visual。"
+        elif wants_report(task) and state.task_profile.get('kind') == 'cli':
+            prompt += ('\n本任务运行于后台 CLI。只用目标机文件的真实读取或文件属性核查作为来源；没有浏览器与桌面操作。'
+                       '如需文字结果，先用 CLI 读取所需文件或属性，最后单独安排 phase="report"，verification 使用 visual。'
+                       '运行成功只证明命令执行；报告内容使用实际读取的证据。')
+        elif wants_report(task):
             prompt += ('\n本任务需要向用户交付文字结果。先规划网页信息收集与核实；最后单独安排 phase="report"，'
                        'goal 为基于已观察来源生成总结/分析，verification 为 visual。'
                        '框架会流式生成正文并保存来源，之后独立审查，不能只打开页面便宣称完成。'

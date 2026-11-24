@@ -1080,74 +1080,66 @@ async def test_connection(request: Request):
         return {"ok": False, "status": -1, "error": str(e)[:300]}
 
 
+def _local_task_options(cfg):
+    for field in ('cli_only', 'disable_desktop_ax', 'disable_ocr_grounding'):
+        if field in cfg and type(cfg[field]) is not bool:
+            raise ValueError(f'{field} 必须是布尔值')
+    mode = cfg.get('task_mode')
+    if mode in ('', None):
+        if cfg.get('cli_only') or (sys.platform.startswith('linux') and not cfg.get('browser_start_url')):
+            mode = 'cli'
+        elif sys.platform == 'win32' and not cfg.get('browser_start_url'):
+            mode = 'desktop'
+        else:
+            mode = 'browser'
+    if mode not in ('desktop', 'browser', 'cli'):
+        raise ValueError('任务场景应为 desktop、browser 或 cli')
+    if cfg.get('cli_only') and mode != 'cli':
+        raise ValueError('cli_only 与任务场景冲突')
+    if mode == 'desktop' and sys.platform != 'win32':
+        raise ValueError('通用桌面模式当前支持 Windows')
+    if sys.platform.startswith('linux') and mode != 'cli':
+        raise ValueError('Linux 本机运行器支持后台文件与终端任务')
+    args = ['--task-mode', mode]
+    if cfg.get('verification_backend') not in (None, '', 'configured', 'terra'):
+        raise ValueError('验证后端应为 configured 或 terra')
+    if cfg.get('verification_backend') == 'terra':
+        args += ['--verification-backend', 'terra']
+    if cfg.get('disable_desktop_ax'):
+        if mode != 'desktop':
+            raise ValueError('禁用桌面 AX 仅适用于通用桌面任务')
+        args.append('--disable-desktop-ax')
+    if cfg.get('disable_ocr_grounding'):
+        args.append('--disable-ocr-grounding')
+    if cfg.get('browser_start_url'):
+        from urllib.parse import urlsplit
+        url = str(cfg['browser_start_url'])
+        parsed = urlsplit(url)
+        if (mode != 'browser' or parsed.scheme != 'http' or parsed.hostname not in {'127.0.0.1', 'localhost'}
+                or parsed.username or parsed.password or parsed.path.rstrip('/') != '/demo/paper-search'
+                or parsed.query or parsed.fragment):
+            raise ValueError('演示起始页需要浏览器模式和本机论文搜索回放页')
+        args += ['--browser-start-url', url]
+    return mode, args
+
+
 def _start_local(cfg: dict, viz_port: int | None = None):
     """启动当前主机平台的本机任务，复用 _reader_thread + /log + /ws。"""
     task = str(cfg.get("task") or "").strip()
     if not task:
         return {"ok": False, "error": "请输入任务描述"}
-    model = cfg.get("model", "Qwen3.6-27B")
-    model_url = cfg.get("model_url", "http://10.44.101.62:8094/v1")
-    model_api_key = cfg.get("model_api_key") or "EMPTY"
-    ground_model = cfg.get("ground_model", "UI-Venus-2-9B")
-    ground_url = cfg.get("ground_url", "http://7.246.80.189:8001/v1")
-    ground_api_key = cfg.get("ground_api_key") or "EMPTY"
-    max_steps = int(cfg.get("max_steps", 40))
-    from ..persistent_chrome import browser_settings, save_browser_settings
-    saved_browser = browser_settings()
-    session_mode = cfg.get('browser_session_mode', saved_browser['browser_session_mode'])
-    profile_dir = cfg.get('browser_profile_dir', saved_browser['browser_profile_dir']) or ''
     try:
-        if session_mode == 'isolated' and not profile_dir:
-            profile_dir = saved_browser['browser_profile_dir']
-        browser_choice = save_browser_settings(session_mode, profile_dir)
-    except ValueError as exc:
-        return {'ok': False, 'error': str(exc)}
-    try:
-        from ..runtime.workspace_config import default_workspace_root, normalize_workspace_root
-        workspace = normalize_workspace_root(cfg.get('workspace_dir') or default_workspace_root())
-    except ValueError as exc:
+        base_cmd = _local_runner_command(cfg)
+        max_steps = int(cfg.get("max_steps", 40))
+    except (TypeError, ValueError) as exc:
         return {"ok": False, "error": str(exc)}
     from ..runtime.workspace_config import allocate_local_result_dir
     run_prefix = None
     result_dir = cfg.get('result_dir') or allocate_local_result_dir(LOCAL_RUNS_DIR)
 
-    cmd = [
-        _runner_python(), "-m", f"{_PACKAGE_NAME}.run_local",
-        "--task", task,
-        "--model", model,
-        "--model-url", model_url,
-        "--model-api-key", model_api_key,
-        "--ground-model", ground_model,
-        "--ground-type", str(cfg.get("ground_type", "qwen-plus")),
-        "--ground-url", ground_url,
-        "--ground-api-key", ground_api_key,
-        "--max-steps", str(max_steps),
-        "--browser-session-mode", session_mode,
-        "--result-dir", result_dir,
-    ]
-    if cfg.get('cli_only') is True:
-        cmd += ['--cli-only']
-    if session_mode == 'persistent' and profile_dir:
-        cmd += ['--browser-profile-dir', profile_dir]
-    cfg.update(browser_session_mode=session_mode, browser_profile_dir=profile_dir,
-               effective_profile_dir=browser_choice['effective_profile_dir'])
+    cmd = base_cmd + ["--task", task, "--result-dir", result_dir]
     if run_prefix:
         cmd += ['--run-prefix', run_prefix]
-    if cfg.get("browser_start_url"):
-        from urllib.parse import urlsplit
-        start_url = str(cfg["browser_start_url"])
-        parsed = urlsplit(start_url)
-        if (parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"}
-                or parsed.path.rstrip("/") != "/demo/paper-search" or parsed.query or parsed.fragment):
-            return {"ok": False, "error": "演示起始页只能使用本机论文搜索回放页"}
-        cmd += ["--browser-start-url", start_url]
-    try:
-        cmd += _wait_cli_args(cfg)
-        from ..planning.prompt_settings import prompt_cli_args
-        cmd += prompt_cli_args(cfg.get('mode_prompts'), Path(LOCAL_RUNS_DIR) / '.prompt_configs')
-        cmd += ['--workspace-dir', workspace]
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
     if cfg.get("completion_spec") is not None:
         from ..verification.verifiers import CompletionVerifier
         try:
@@ -1196,6 +1188,13 @@ def _start_local(cfg: dict, viz_port: int | None = None):
 def _wait_cli_args(cfg):
     import math
     from ..memory.knowledge_selection import selection_cli_args
+    if cfg.get('verification_backend') == 'terra':
+        from ..model.terra_verification import MODEL, SYSTEM_ONE_URL
+        options = cfg.get('decision_judge', {})
+        if not isinstance(options, dict):
+            raise ValueError('Decision 评估器配置必须是对象')
+        cfg = {**cfg, 'decision_judge': {**options, 'url': SYSTEM_ONE_URL, 'model': MODEL},
+               'knowledge_jev_url': SYSTEM_ONE_URL}
     result = _judge_cli_args(cfg) + selection_cli_args(cfg)
     for field, flag, default in (("operation_timeout_s", "--operation-timeout", 300),
                                   ("task_timeout_s", "--task-timeout", 1800)):
@@ -1217,7 +1216,9 @@ def _wait_cli_args(cfg):
 def _judge_cli_args(cfg):
     """Both runners use the same validated optional System One configuration."""
     from ..model.decision_judge import DecisionJudgeConfig
-    data = cfg.get('decision_judge') or {}
+    data = cfg.get('decision_judge', {})
+    if data is None:
+        data = {}
     if not isinstance(data, dict):
         raise ValueError('Decision 评估器配置必须是对象')
     if data.get('api_key'):
@@ -1358,32 +1359,42 @@ def _parse_tasks_file(path):
     return tasks
 
 
-def _build_batch_cmd(cfg, task, result_dir):
-    """批量子进程命令：复用与单条一致的模型 / grounding / 判效 / 知识配置。"""
-    cmd = [
-        _runner_python(), "-m", f"{_PACKAGE_NAME}.run_local",
-        "--task", task,
-        "--model", cfg.get("model", "Qwen3.6-27B"),
-        "--model-url", cfg.get("model_url", "http://10.44.101.62:8094/v1"),
-        "--model-api-key", cfg.get("model_api_key") or "EMPTY",
-        "--ground-model", cfg.get("ground_model", "UI-Venus-2-9B"),
-        "--ground-type", str(cfg.get("ground_type", "ui-venus2")),
-        "--ground-url", cfg.get("ground_url", "http://7.246.80.189:8001/v1"),
-        "--ground-api-key", cfg.get("ground_api_key") or "EMPTY",
-        "--max-steps", str(int(cfg.get("max_steps", 40))),
-        "--result-dir", result_dir,
-    ]
-    try:
-        cmd += _wait_cli_args(cfg)
-    except ValueError:
-        pass
-    try:
-        from ..runtime.workspace_config import default_workspace_root, normalize_workspace_root
-        workspace = normalize_workspace_root(cfg.get('workspace_dir') or default_workspace_root())
-        cmd += ['--workspace-dir', workspace]
-    except ValueError:
-        pass
-    return cmd
+def _local_runner_command(cfg):
+    """Validate the single/batch configuration once before allocating an episode."""
+    from ..planning.prompt_settings import prompt_cli_args
+    from ..runtime.workspace_config import default_workspace_root, normalize_workspace_root
+    mode, args = _local_task_options(cfg)
+    max_steps = cfg.get('max_steps', 40)
+    if not str(max_steps).isdecimal() or int(max_steps) < 1:
+        raise ValueError('最大决策步数必须是正整数')
+    workspace = normalize_workspace_root(cfg.get('workspace_dir') or default_workspace_root())
+    args += ['--max-steps', str(max_steps), '--workspace-dir', workspace]
+    args += _wait_cli_args(cfg)
+    if cfg.get('verification_backend') != 'terra':
+        ground_type = cfg.get('ground_type', 'qwen-plus' if sys.platform == 'darwin' else 'ui-venus2')
+        if ground_type not in ('ui-venus2', 'ui-tars', 'qwen-plus'):
+            raise ValueError('无法识别视觉定位模型类型')
+        args += ['--model', cfg.get('model', 'Qwen3.6-27B'),
+                 '--model-url', cfg.get('model_url', 'http://10.44.101.62:8094/v1'),
+                 '--model-api-key', cfg.get('model_api_key') or 'EMPTY', '--ground-type', ground_type,
+                 '--ground-model', cfg.get('ground_model', 'UI-Venus-2-9B'),
+                 '--ground-url', cfg.get('ground_url', 'http://7.246.80.189:8001/v1'),
+                 '--ground-api-key', cfg.get('ground_api_key') or 'EMPTY']
+    if mode == 'browser':
+        from ..persistent_chrome import browser_settings, save_browser_settings
+        saved = browser_settings()
+        session = cfg.get('browser_session_mode', saved['browser_session_mode'])
+        profile = cfg.get('browser_profile_dir', saved['browser_profile_dir'])
+        if session == 'isolated' and not profile:
+            profile = saved['browser_profile_dir']
+        choice = save_browser_settings(session, profile)
+        args += ['--browser-session-mode', session]
+        if session == 'persistent' and choice['browser_profile_dir']:
+            args += ['--browser-profile-dir', choice['browser_profile_dir']]
+        cfg.update(choice)
+    args += prompt_cli_args(cfg.get('mode_prompts'), Path(LOCAL_RUNS_DIR) / '.prompt_configs')
+    cfg['task_mode'] = mode
+    return [_runner_python(), '-m', f'{_PACKAGE_NAME}.run_local', *args]
 
 
 def _read_run_result(result_dir):
@@ -1404,7 +1415,7 @@ def _read_run_result(result_dir):
             'elapsed_s': m.get('elapsed_s')}
 
 
-def _run_batch_worker(cfg, tasks):
+def _run_batch_worker(base_cmd, tasks):
     from ..runtime.workspace_config import allocate_local_result_dir
     report_path = os.path.join(LOCAL_RUNS_DIR, 'batch_report_' + time.strftime('%Y%m%d_%H%M%S') + '.csv')
     results = []
@@ -1425,12 +1436,12 @@ def _run_batch_worker(cfg, tasks):
                 _batch_state['current'] = t.get('task_id') or t['instruction'][:40]
                 result_dir = allocate_local_result_dir(LOCAL_RUNS_DIR)
                 try:
-                    cmd = _build_batch_cmd(cfg, t['instruction'], result_dir)
+                    cmd = base_cmd + ['--task', t['instruction'], '--result-dir', result_dir]
                     proc = subprocess.Popen(cmd, cwd=AGENT_ROOT, env=env,
                                             stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
                     while proc.poll() is None:
                         if _batch_state['stop']:
-                            proc.kill()
+                            _stop_runner_process(proc)
                             break
                         time.sleep(1.0)
                     proc.wait()
@@ -1464,6 +1475,8 @@ async def start_batch(request: Request):
         body = await request.json()
     except Exception:
         return {"ok": False, "error": "invalid json"}
+    if not isinstance(body, dict):
+        return {"ok": False, "error": "批量请求必须是对象"}
     filename = body.get('filename') or ''
     ext = os.path.splitext(filename)[1].lower()
     if ext not in {'.xlsx', '.xls', '.csv'}:
@@ -1488,12 +1501,16 @@ async def start_batch(request: Request):
             pass
     if not tasks:
         return {"ok": False, "error": "表格里没有读到任务（请确认第 1 列是任务描述）"}
-    cfg = body.get('config') or {}
+    cfg = body.get('config', {})
     if not isinstance(cfg, dict):
-        cfg = {}
+        return {"ok": False, "error": "批量任务配置必须是对象"}
+    try:
+        base_cmd = _local_runner_command(cfg)
+    except (TypeError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
     _batch_state.update(running=True, total=len(tasks), done=0, current='',
                         results=[], error='', stop=False, report_path='', started_at=time.time())
-    threading.Thread(target=_run_batch_worker, args=(cfg, tasks), daemon=True).start()
+    threading.Thread(target=_run_batch_worker, args=(base_cmd, tasks), daemon=True).start()
     return {"ok": True, "total": len(tasks)}
 
 
@@ -1518,6 +1535,8 @@ async def start_run(request: Request):
         cfg = await request.json()
     except Exception:
         return {"ok": False, "error": "invalid json"}
+    if not isinstance(cfg, dict):
+        return {"ok": False, "error": "任务配置必须是对象"}
 
     from ..planning.prompt_settings import validate_mode_prompts
     try:
@@ -1622,22 +1641,29 @@ async def run_status():
     }
 
 
+def _stop_runner_process(proc):
+    if proc.poll() is not None:
+        return
+    if os.name == 'nt':
+        try:
+            stopped = subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                                     capture_output=True, timeout=15)
+            if stopped.returncode == 0 or proc.poll() is not None:
+                return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
 @app.post("/run/stop")
 async def stop_run():
     proc = _agent_state["proc"]
-    if proc and proc.poll() is None:
-        if os.name == 'nt':
-            try:
-                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
-                               capture_output=True, timeout=15)
-            except Exception:
-                proc.terminate()
-        else:
-            proc.terminate()
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+    if proc:
+        _stop_runner_process(proc)
     _agent_state["status"] = "idle"
     _agent_state["proc"] = None
     _agent_state["task_name"] = None

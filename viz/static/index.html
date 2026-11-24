@@ -509,12 +509,15 @@
             <div class="run-row"><label for="local-workspace-dir">默认工程文件夹</label><div class="workspace-picker"><input id="local-workspace-dir" type="text" placeholder="选择或输入本机文件夹的绝对路径" autocomplete="off"><button id="local-workspace-choose" class="studio-btn secondary" type="button"><svg><use href="#i-folder"/></svg>选择文件夹</button></div><span id="local-workspace-status" class="field-tip" role="status">下载和产出文件按日期保存在此目录。</span></div>
             <div class="browser-preference">
               <label class="checkbox-row" title="勾选后保留任务浏览器的 Cookie 和站点存储；取消后每次使用临时隔离会话。"><input id="local-browser-session" type="checkbox" checked aria-describedby="local-browser-session-status">保留任务浏览器登录状态</label>
-              <label class="checkbox-row"><input id="local-cli-only" type="checkbox">仅后台 CLI（文件与终端，不启动浏览器）</label>
+              <label class="field-label" for="local-task-mode">任务场景</label>
+              <select id="local-task-mode"><option value="">本机默认</option><option value="desktop">Windows 通用桌面</option><option value="browser">浏览器</option><option value="cli">后台文件与终端</option></select>
+              <label class="checkbox-row"><input id="local-terra" type="checkbox">使用 GPT-6.1 Terra 验证三个模型角色</label>
+              <label class="checkbox-row"><input id="local-visual-only" type="checkbox">纯视觉桌面验证（关闭 AX 和 OCR 回退）</label>
               <input id="local-browser-profile" type="hidden">
               <span id="local-browser-session-status" class="field-tip error" role="status" hidden></span>
             </div>
             <label class="field-label" for="local-task">任务描述</label>
-            <textarea id="local-task" rows="6" placeholder="例如：搜索论文 Attention Is All You Need，找到原文并下载 PDF。"></textarea>
+            <textarea id="local-task" rows="6" placeholder="例如：用记事本保存一份包含指定文字的文件。"></textarea>
             <div class="field-tip">描述明确的目标、限制和期望结果。</div>
             <div class="form-two task-limits">
               <div class="run-row"><label for="local-maxsteps">最大决策步数</label><input id="local-maxsteps" type="number" value="40" min="1" max="200"></div>
@@ -2063,11 +2066,11 @@ for (const id of judgeRuntimeFields) document.getElementById(id).addEventListene
   }
   try { localStorage.setItem(JUDGE_RUNTIME_STORAGE_KEY, JSON.stringify(saved)); } catch (e) {}
 });
-function decisionJudgeConfig() {
+function decisionJudgeConfig(useTerra = false) {
   const model = document.getElementById('judge-model').value;
-  if (!model) return {};
+  if (!model && !useTerra) return {};
   const url = document.getElementById('judge-url').value.trim();
-  if (!url) { alert('请填写 Jev 服务地址，或选择复用决策模型。'); return null; }
+  if (!url && !useTerra) { alert('请填写 Jev 服务地址，或选择复用决策模型。'); return null; }
   return {model, url, review_mode:'exclusive', selection_policy:document.getElementById('judge-selection-policy').value,
     revision: document.getElementById('judge-revision').value.trim(),
     threshold:Number(document.getElementById('judge-threshold').value), margin:Number(document.getElementById('judge-margin').value),
@@ -2172,10 +2175,22 @@ document.getElementById('local-workspace-choose').addEventListener('click', asyn
   } catch (e) { setWorkspaceStatus(e.message, true); }
   finally { button.disabled = false; }
 });
+const localTaskMode = document.getElementById('local-task-mode');
+const visualOnly = document.getElementById('local-visual-only');
+localTaskMode.addEventListener('change', () => {
+  visualOnly.disabled = !['', 'desktop'].includes(localTaskMode.value);
+  if (visualOnly.disabled) visualOnly.checked = false;
+});
+function localTaskOptions() {
+  return {task_mode: localTaskMode.value || (visualOnly.checked ? 'desktop' : ''),
+    verification_backend: document.getElementById('local-terra').checked ? 'terra' : 'configured',
+    disable_desktop_ax: visualOnly.checked, disable_ocr_grounding: visualOnly.checked};
+}
 async function startLocalTask() {
   let modePrompts;
   try { modePrompts = await decisionPromptConfig(); } catch (e) { alert(e.message); return; }
-  const judge = decisionJudgeConfig(); if (judge === null) return;
+  const options = localTaskOptions();
+  const judge = decisionJudgeConfig(options.verification_backend === 'terra'); if (judge === null) return;
   const task = document.getElementById('local-task').value.trim();
   if (!task) { alert('请输入任务描述'); return; }
   let workspaceDir;
@@ -2183,7 +2198,7 @@ async function startLocalTask() {
   catch (e) { setWorkspaceStatus(e.message, true); workspaceField.focus(); return; }
   const cfg = {
     mode: 'local',
-    cli_only: document.getElementById('local-cli-only').checked,
+    ...options,
     mode_prompts: modePrompts,
     browser_session_mode: browserSessionField.checked ? 'persistent' : 'isolated',
     browser_profile_dir: browserProfileField.value.trim(),
@@ -2230,10 +2245,11 @@ async function startBatch() {
   if (!file) { alert('请先选择 Excel / CSV 文件'); return; }
   let modePrompts, judge, workspaceDir;
   try { modePrompts = await decisionPromptConfig(); } catch (e) { alert(e.message); return; }
-  judge = decisionJudgeConfig(); if (judge === null) return;
+  const options = localTaskOptions();
+  judge = decisionJudgeConfig(options.verification_backend === 'terra'); if (judge === null) return;
   try { workspaceDir = await saveWorkspaceDefault(); } catch (e) { alert(e.message); return; }
   const cfg = {
-    cli_only: document.getElementById('local-cli-only').checked,
+    ...options,
     mode_prompts: modePrompts,
     browser_session_mode: browserSessionField.checked ? 'persistent' : 'isolated',
     browser_profile_dir: browserProfileField.value.trim(),

@@ -74,7 +74,7 @@ class ReviewService:
         return report, public
 
     def _review_visual(self, state, step, execution_info, code, identity, before=None):
-        from ..reporting.report_delivery import report_system_evidence
+        from ..reporting.report_delivery import report_source_images, report_system_evidence
         from ..reporting.report_review import text_only_task, review_packet
         text_review = (step.get('id') in {'whole_task', 'final'}
                        and bool(getattr(state, 'report_delivery', None)) and text_only_task(state.task, code))
@@ -86,6 +86,14 @@ class ReviewService:
                 self._publish_review(report)
                 return report
             code = {**code, 'report_review': packet}
+            images = report_source_images(state, state.report_delivery.get('sources', []))
+            if set(packet['visual_source_ids']) - {ident for ident, _ in images}:
+                report = {**identity, 'method': 'code', 'status': 'unknown', 'review_scope': 'text_report',
+                          'reason': '报告引用的桌面截图证据不可用', 'evidence': []}
+                self._publish_review(report)
+                return report
+            if images:
+                code['report_images'] = images
         code = {**code, 'file_delivery_evidence': report_system_evidence(state),
                 'file_review_instruction': '写入成功只证明保存，不证明正文正确。对照真实读回正文、网页证据与用户要求核对名单及数量；总数与实际条目矛盾不能通过。读回是写入时快照，不代表之后未改变。'}
         if getattr(state, 'report_sources', None):
@@ -100,6 +108,10 @@ class ReviewService:
         if getattr(state, 'report_delivery', None):
             code = {**code, 'report_delivery': {k: v for k, v in state.report_delivery.items() if k != 'sources'},
                     'report_review_instruction': '核对正文是否基于已观察来源并覆盖用户要求；正文不是框架自证，不能覆盖明确代码失败。'}
+            if step.get('id') in {'whole_task', 'final'} and not text_review:
+                images = report_source_images(state, state.report_delivery.get('sources', []))
+                if images:
+                    code['report_images'] = images
         # Explicit Jev selection covers both step and final semantic review.
         # Unknown stays unknown; deterministic gates are enforced by callers.
         if unresolved_desktop_checks(code):

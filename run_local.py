@@ -13,4 +13,6 @@ def host_platform():
 
 
 if __name__ == '__main__':
-    raise SystemExit(main(platform=('linux' if sys.platform.startswith('linux') and '--cli-only' in sys.argv else host_platform())))
+    # The runner resolves both --cli-only and --task-mode cli (including =cli)
+    # and rejects Linux GUI modes after normal argparse validation.
+    raise SystemExit(main(platform='linux' if sys.platform.startswith('linux') else host_platform()))

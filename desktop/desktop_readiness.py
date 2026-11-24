@@ -48,6 +48,8 @@ def launch_target(action):
 
 
 def global_shortcut(action):
+    if action.action == 'press':
+        return str(action.args.get('key', '')).casefold() in {'win', 'winleft', 'winright'}
     if action.action != 'hotkey':
         return False
     keys = {str(k).lower() for k in action.args.get('keys', [])}

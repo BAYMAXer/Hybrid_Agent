@@ -52,8 +52,97 @@ def validate_cli(args):
     return None
 
 
+def office_contains_text(path, needle, timeout):
+    """Search OOXML's logical document text without returning file contents."""
+    import posixpath
+    import time
+    import zipfile
+    from xml.etree import ElementTree as ET
+
+    deadline = time.monotonic() + timeout
+    remaining_bytes = 48 * 1024 * 1024
+
+    def read_part(package, name):
+        nonlocal remaining_bytes
+        size = package.getinfo(name).file_size
+        if time.monotonic() >= deadline or size > 8 * 1024 * 1024 or size > remaining_bytes:
+            raise TimeoutError('Office text verification limit reached')
+        remaining_bytes -= size
+        data = package.read(name)
+        if b'<!DOCTYPE' in data.upper() or b'<!ENTITY' in data.upper():
+            raise ValueError('unsupported XML declaration')
+        return ET.fromstring(data)
+
+    def fragments(package):
+        if path.suffix.casefold() == '.docx':
+            ns = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+            document = read_part(package, 'word/document.xml')
+            body = document.find(ns + 'body')
+            if document.tag != ns + 'document' or body is None:
+                raise ValueError('invalid Word document body')
+            for paragraph in body.iter(ns + 'p'):
+                yield ''.join(child.text or '' for child in paragraph.iter(ns + 't'))
+            return
+
+        ns = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
+        relation_id = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id'
+        workbook = read_part(package, 'xl/workbook.xml')
+        if workbook.tag != ns + 'workbook':
+            raise ValueError('invalid Excel workbook')
+        relationships = {item.get('Id'): item for item in read_part(package, 'xl/_rels/workbook.xml.rels')}
+
+        def rich_text(element):
+            return ''.join(child.text or '' for child in element.findall(ns + 't') + element.findall(ns + 'r/' + ns + 't'))
+
+        shared_strings = []
+        if 'xl/sharedStrings.xml' in package.namelist():
+            shared_strings = [rich_text(item) for item in read_part(package, 'xl/sharedStrings.xml').iter(ns + 'si')]
+        for sheet in workbook.iter(ns + 'sheet'):
+            relationship = relationships.get(sheet.get(relation_id))
+            if relationship is None or relationship.get('TargetMode') == 'External' or not relationship.get('Target'):
+                raise ValueError('missing internal workbook sheet relationship')
+            if not relationship.get('Type', '').endswith('/worksheet'):
+                continue  # Charts and other non-worksheet workbooks parts carry no cells.
+            target = relationship.get('Target')
+            name = posixpath.normpath(target.lstrip('/') if target.startswith('/') else 'xl/' + target)
+            if not name.startswith('xl/'):
+                raise ValueError('invalid worksheet relationship')
+            worksheet = read_part(package, name)
+            if worksheet.tag != ns + 'worksheet':
+                raise ValueError('invalid Excel worksheet')
+            for cell in worksheet.iter(ns + 'c'):
+                kind = cell.get('t')
+                value = cell.findtext(ns + 'v')
+                if kind == 'inlineStr':
+                    inline = cell.find(ns + 'is')
+                    if inline is not None:
+                        yield rich_text(inline)
+                elif value is not None:
+                    if kind == 's':
+                        index = int(value)
+                        if not 0 <= index < len(shared_strings):
+                            raise ValueError('invalid shared string reference')
+                        value = shared_strings[index]
+                    elif kind == 'b':
+                        value = {'0': 'FALSE', '1': 'TRUE'}.get(value, value)
+                    yield value
+
+    # Search the parsed part content, not the ZIP bytes or unused shared values.
+    with zipfile.ZipFile(path) as package:
+        read_part(package, '[Content_Types].xml')
+        tail = ''
+        for fragment in fragments(package):
+            if time.monotonic() >= deadline:
+                raise TimeoutError('Office text verification limit reached')
+            content = tail + fragment
+            if needle in content:
+                return True
+            tail = (content + '\n')[-len(needle) + 1:] if len(needle) > 1 else ''
+    return False
+
+
 def target_worker(args, workspace):
-    # Self-contained: serialized by execute_remote, must have no module globals.
+    # Serialized by execute_cli alongside the stdlib-only Office helper.
     import hashlib
     import os
     import shutil
@@ -139,10 +228,19 @@ def target_worker(args, workspace):
                         entries.append(stat(Path(entry.path)))
                 result['entries'] = sorted(entries, key=lambda e: e['path'])
             elif op == 'read':
-                with p.open('rb') as f:
-                    data = f.read(16001)
-                result.update(stdout=data[:16000].decode('utf-8', errors='replace'), stdout_truncated=len(data)>16000,
-                              file=stat(p))
+                needle = args.get('_file_content')
+                if needle and p.suffix.casefold() in {'.docx', '.xlsx'}:
+                    before = p.stat()
+                    found = office_contains_text(p, needle, args.get('timeout_s', 30))
+                    after = p.stat()
+                    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+                        raise OSError('file changed during Office text verification')
+                    result.update(office_text_contains=found, content_scope='office_document_text', file=stat(p))
+                else:
+                    with p.open('rb') as f:
+                        data = f.read(16001)
+                    result.update(stdout=data[:16000].decode('utf-8', errors='replace'), stdout_truncated=len(data)>16000,
+                                  file=stat(p))
             elif op == 'write':
                 data = args['content'].encode('utf-8')
                 # Exclusive create by default; replacement must be explicit.
@@ -219,19 +317,23 @@ def target_worker(args, workspace):
     return result
 
 
-def execute_cli(env, args, remaining_s=120):
+def execute_cli(env, args, remaining_s=120, *, file_content=None):
     error = validate_cli(args)
     capability = cli_capability(env)
     if error or not capability['available'] or remaining_s <= 0:
         return {'channel': 'cli', 'status': 'rejected', 'dispatched': False,
                 'reason': error or capability.get('reason') or '任务时限已耗尽'}
     args = dict(args, timeout_s=min(float(args.get('timeout_s', 30)), max(.001, remaining_s)))
+    if file_content and args['operation'] == 'read':
+        args['_file_content'] = file_content
     if capability['target'] == 'local':
         return target_worker(args, capability['workspace'])
     # Explicit guest Python port. NEVER call run_python/run_command wrappers:
     # their legacy host fallback can operate on the wrong computer.
     payload = base64.b64encode(json.dumps([args, capability['workspace']], ensure_ascii=False).encode()).decode()
     source = inspect.getsource(target_worker)
+    if '_file_content' in args:
+        source = inspect.getsource(office_contains_text) + '\n' + source
     code = source + '\nimport json,base64\nprint("AGENT_CLI_RESULT="+json.dumps(target_worker(*json.loads(base64.b64decode(' + repr(payload) + '))),ensure_ascii=False))'
     try:
         response = env.controller.run_python_script(code)
@@ -267,5 +369,6 @@ def file_check_samples(env, predicates, remaining):
         args = {'operation': 'read' if p['kind'] == 'file_content' else 'stat', 'path': p['path']}
         if p['kind'] == 'files_equal':
             args.update(operation='compare', destination=p['other_path'])
-        samples.append({'predicate': dict(p), 'result': execute_cli(env, args, remaining_s=remaining())})
+        expected = p.get('text') if p['kind'] == 'file_content' else None
+        samples.append({'predicate': dict(p), 'result': execute_cli(env, args, remaining_s=remaining(), file_content=expected)})
     return samples

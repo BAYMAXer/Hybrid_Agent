@@ -5,7 +5,7 @@ import re
 import time
 
 
-def windows_runtime_state():
+def windows_runtime_state(*, include_layout=False):
     if sys.platform != "win32":
         return {"applications": [], "complete": False}
     try:
@@ -30,7 +30,7 @@ def windows_runtime_state():
         kernel.OpenProcess.restype = wintypes.HANDLE
         kernel.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
         kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-        apps, errors = [], []
+        apps, errors, layout = [], [], []
 
         @callback_type
         def visit(hwnd, _):
@@ -40,7 +40,18 @@ def windows_runtime_state():
                     return True
                 title = ctypes.create_unicode_buffer(1024)
                 user.GetWindowTextW(hwnd, title, len(title))
-                if not title.value:
+                class_name = ctypes.create_unicode_buffer(256)
+                user.GetClassNameW(hwnd, class_name, len(class_name))
+                rect, cloaked = wintypes.RECT(), wintypes.DWORD()
+                bounds = ([rect.left, rect.top, rect.right, rect.bottom]
+                          if user.GetWindowRect(hwnd, ctypes.byref(rect)) else None)
+                cloak_ok = dwm.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked)) == 0
+                if include_layout and cloak_ok and cloaked.value:
+                    return True
+                if include_layout and bounds and not user.IsIconic(hwnd) and not cloaked.value:
+                    layout.append((int(hwnd), tuple(bounds)))
+                if not title.value and not (hwnd == foreground and class_name.value in
+                                            {'Progman', 'WorkerW', 'Shell_TrayWnd', 'Shell_SecondaryTrayWnd'}):
                     return True
                 pid = wintypes.DWORD()
                 user.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
@@ -50,12 +61,6 @@ def windows_runtime_state():
                 if not handle or not kernel.QueryFullProcessImageNameW(handle, 0, path, ctypes.byref(length)):
                     errors.append(True)
                     return True
-                class_name = ctypes.create_unicode_buffer(256)
-                user.GetClassNameW(hwnd, class_name, len(class_name))
-                rect, cloaked = wintypes.RECT(), wintypes.DWORD()
-                bounds = ([rect.left, rect.top, rect.right, rect.bottom]
-                          if user.GetWindowRect(hwnd, ctypes.byref(rect)) else None)
-                cloak_ok = dwm.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked)) == 0
                 apps.append({"process_name": os.path.basename(path.value), "pid": pid.value, "title": title.value,
                              "hwnd": int(hwnd), "class_name": class_name.value, "foreground": hwnd == foreground,
                              "bounds": bounds, "visible": True, "minimized": bool(user.IsIconic(hwnd)),
@@ -68,8 +73,14 @@ def windows_runtime_state():
                     kernel.CloseHandle(handle)
             return True
 
-        complete = bool(user.EnumWindows(visit, 0)) and not errors
-        return {"applications": apps, "complete": complete, "source": "windows_window_api"}
+        if include_layout:
+            from .desktop_capture import physical_dpi_context
+            with physical_dpi_context():
+                complete = bool(user.EnumWindows(visit, 0)) and not errors
+        else:
+            complete = bool(user.EnumWindows(visit, 0)) and not errors
+        return {"applications": apps, "complete": complete, "source": "windows_window_api",
+                **({"_window_layout": layout} if include_layout else {})}
     except Exception:
         return {"applications": [], "complete": False}
 
@@ -93,6 +104,94 @@ def windows_application_process(app_code):
     if re.fullmatch(r'[a-z0-9_-]+(?:\.exe)?', code):
         return code.removesuffix('.exe')
     return None
+
+
+def pointer_guard(action, origin, browser_handles, layouts, *, leaving_browser=False):
+    """Recheck local window geometry at the gesture points, including background windows."""
+    if sys.platform != 'win32':
+        return ""
+    import ctypes
+    import math
+    from ctypes import wintypes
+    from .desktop_capture import physical_dpi_context
+    user = ctypes.WinDLL('user32', use_last_error=True)
+    user.WindowFromPoint.argtypes, user.WindowFromPoint.restype = [wintypes.POINT], wintypes.HWND
+    user.GetAncestor.argtypes, user.GetAncestor.restype = [wintypes.HWND, wintypes.UINT], wintypes.HWND
+    fields = [('x1', 'y1'), ('x2', 'y2')] if action.action == 'drag_and_drop' else [('x', 'y')]
+    with physical_dpi_context():
+        points = []
+        if action.action == 'scroll':
+            point = wintypes.POINT()
+            if not user.GetCursorPos(ctypes.byref(point)):
+                raise OSError('无法确认当前滚动落点')
+            points.append(point)
+        else:
+            for x, y in fields:
+                values = [action.args.get(x), action.args.get(y)]
+                if all(type(v) in (int, float) and math.isfinite(v) and 0 <= v < 2**30 for v in values):
+                    points.append(wintypes.POINT(int(values[0]) + origin[0], int(values[1]) + origin[1]))
+        for p in points:
+            owner = user.GetAncestor(user.WindowFromPoint(p), 2)
+            if owner in browser_handles or (leaving_browser and not owner):
+                return "browser_task_out_of_scope"
+            if layouts and not stable_point_layout((p.x, p.y), layouts, owner=owner):
+                return "desktop_window_geometry_changed"
+    return "browser_task_out_of_scope" if leaving_browser and not points else ""
+
+
+def stable_point_layout(point, layouts, *, owner=None):
+    """Compare overlapping layers through the live owner, including click-through overlays."""
+    x, y = point
+    samples = []
+    for layout in layouts:
+        at_point = []
+        for hwnd, bounds in layout:
+            if bounds[0] <= x < bounds[2] and bounds[1] <= y < bounds[3]:
+                at_point.append((hwnd, tuple(bounds)))
+                if not owner or hwnd == owner:
+                    break
+        samples.append(at_point)
+    return all(sample == samples[0] for sample in samples)
+
+
+def common_file_dialog(window, block):
+    """Identify the native shell file picker and its separate overwrite prompt."""
+    if not window or window.get("class_name") != "#32770":
+        return "", ""
+    title = str(window.get("title", "")).strip().casefold()
+    nodes = (block or {}).get("nodes", [])
+    text = " ".join(str(n.get("name", "")) for n in nodes if n.get("role") == "text")
+    if (title in {"确认另存为", "confirm save as", "confirm file replace"}
+            or (title == "确认替换" and any(term in text for term in ("文件", "已存在")))):
+        return "overwrite", text
+    if title not in {"另存为", "保存为", "保存", "打开", "选择文件", "save as", "save", "open", "select file"}:
+        return "", ""
+    if any(any(tag in str(n.get("name", "")).casefold() for tag in ("文件名", "file name", "filename"))
+           for n in nodes):
+        return "picker", ""
+    if sys.platform != "win32" or not window.get("hwnd"):
+        return "", ""
+    # Accessibility can be unavailable. FileNameControlHost / cmb13 or edt1
+    # plus the shell view distinguish the Explorer-style picker from another
+    # application's own dialog with the same title.
+    import ctypes
+    from ctypes import wintypes
+    user = ctypes.WinDLL("user32", use_last_error=True)
+    callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user.EnumChildWindows.argtypes = [wintypes.HWND, callback, wintypes.LPARAM]
+    user.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user.GetDlgCtrlID.argtypes = [wintypes.HWND]
+    classes, ids = set(), set()
+    @callback
+    def visit(child, _):
+        buf = ctypes.create_unicode_buffer(128)
+        user.GetClassNameW(child, buf, len(buf))
+        classes.add(buf.value)
+        ids.add(user.GetDlgCtrlID(child))
+        return True
+    user.EnumChildWindows(window["hwnd"], visit, 0)
+    shell = bool(classes & {"SHELLDLL_DefView", "DUIViewWndClassName", "NamespaceTreeControl"})
+    return ("picker", "") if shell and (ids & {0x47C, 0x480} or "ComboBox" in classes) else ("", "")
 
 
 def _activate_window(hwnd):
@@ -132,7 +231,8 @@ def switch_windows_application(app_code):
                 'reason': 'app_code 必须是应用标识或进程名，不能是命令；也可通过任务栏或系统启动器操作。'}
     runtime = windows_runtime_state()
     matches = [a for a in runtime.get('applications', [])
-               if str(a.get('process_name', '')).casefold().removesuffix('.exe') == process and a.get('hwnd')]
+               if str(a.get('process_name', '')).casefold().removesuffix('.exe') == process and a.get('hwnd')
+               and a.get('cloaked') is not True]
     if process == 'explorer':
         # explorer.exe also owns the desktop and taskbar; those are not folders.
         matches = [a for a in matches if a.get('class_name') in {'CabinetWClass', 'ExploreWClass'}]

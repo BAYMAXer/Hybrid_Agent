@@ -1,15 +1,8 @@
-"""Windows 本地手动任务运行器：自由文本任务 → Agent + WindowsEnvironment。
+"""Run a Windows desktop, browser or background file task and record its trajectory.
 
-跑一个本地 GUI 任务（重点：浏览器任务），逐步回放 + 落盘轨迹/截图。
-
-用法：
-    python run_windows_local.py --task "用谷歌学术(scholar.google.com)搜索 'attention is all you need'，告诉我第一个搜索结果"
-
-说明：
-- 自动启动本任务专用的 remote-debugging Chrome，结束时只清理该实例；
-- 决策默认使用 DashScope 多模态 API，Windows grounding 默认使用 UI-Venus；可用命令行或 Studio 模型预设覆盖；
-- 屏幕分辨率自动检测，也可用 --width/--height 覆盖；
-- 浏览器页面优先走 CDP/DOM；桌面接管时才使用本机鼠标键盘。
+Windows starts on the native desktop by default. Select --task-mode browser for
+the Chrome/CDP lifecycle, or --task-mode cli for background file operations.
+Select --verification-backend terra to exercise all three roles through Codex.
 """
 from __future__ import annotations
 
@@ -306,13 +299,7 @@ def main(platform: str = 'windows') -> int:
     except Exception:  # noqa: BLE001
         pass
 
-    if platform not in {'windows', 'mac'} and not (platform == 'linux' and '--cli-only' in sys.argv):
-        raise ValueError(f'不支持的本机平台: {platform}')
     previous_sigterm = None
-    if platform == 'mac' or '--cli-only' in sys.argv:
-        # Studio 的“停止”向子进程发送 SIGTERM；转成 Python 退出才能执行下方 finally。
-        previous_sigterm = signal.getsignal(signal.SIGTERM)
-        signal.signal(signal.SIGTERM, lambda _signum, _frame: (_ for _ in ()).throw(SystemExit(143)))
     parser = argparse.ArgumentParser(description=f"{platform} 本地手动任务运行器")
     from .model.decision_judge import add_judge_arguments, judge_config_from_args
     add_judge_arguments(parser)
@@ -321,6 +308,12 @@ def main(platform: str = 'windows') -> int:
     parser.add_argument('--judge-selection-policy', choices=['threshold', 'maximum_probability'],
                         default='maximum_probability', help='Jev 标签选择：默认直接采用最高概率；threshold 使用阈值与分差')
     parser.add_argument("--cli-only", action="store_true", help="只使用后台文件和终端，不启动浏览器或桌面输入")
+    parser.add_argument("--task-mode", choices=["desktop", "browser", "cli"],
+                        help="Windows 默认使用原生桌面；browser 显式启动 CDP，cli 只使用后台操作")
+    parser.add_argument("--verification-backend", choices=["configured", "terra"], default="configured",
+                        help="terra 通过已登录的 Codex app-server 调用 GPT-6.1 Terra 验证三个模型角色")
+    parser.add_argument("--disable-desktop-ax", action="store_true", help="禁用原生 AX，验证纯视觉路径")
+    parser.add_argument("--disable-ocr-grounding", action="store_true", help="视觉模型定位失败时不使用 OCR 回退")
     parser.add_argument("--task", required=True, help="自由文本任务描述")
     parser.add_argument("--model", default="Qwen3.6-27B")
     parser.add_argument("--model-url", default="http://10.44.101.62:8094/v1")
@@ -371,6 +364,20 @@ def main(platform: str = 'windows') -> int:
     parser.add_argument("--task-id", help="数据集任务标识；缺省按任务文本生成")
     parser.add_argument('--mode-prompts-file', help='Studio 保存的各模式决策提示词 JSON')
     args = parser.parse_args()
+    if args.cli_only and args.task_mode not in {None, 'cli'}:
+        parser.error("--cli-only 与所选 --task-mode 冲突")
+    args.task_mode = args.task_mode or ('cli' if args.cli_only else
+                                       'desktop' if platform == 'windows' else 'browser')
+    args.cli_only = args.task_mode == 'cli'
+    if platform not in {'windows', 'mac'} and not (platform == 'linux' and args.cli_only):
+        parser.error(f'不支持的本机平台或任务模式: {platform}/{args.task_mode}')
+    if args.task_mode == 'desktop' and platform != 'windows':
+        parser.error("通用桌面任务模式目前需要 Windows")
+    if args.verification_backend == 'terra' and args.capture_rollout:
+        parser.error("Terra 验证后端不提供 rollout token 概率")
+    if platform == 'mac' or args.cli_only:
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, lambda _signum, _frame: (_ for _ in ()).throw(SystemExit(143)))
     from .planning.prompt_settings import load_mode_prompts
     mode_prompts = load_mode_prompts(args.mode_prompts_file)
     if args.result_dir is None:
@@ -391,12 +398,13 @@ def main(platform: str = 'windows') -> int:
         with open(args.private_completion_spec, encoding="utf-8") as f:
             private_completion_spec = json.load(f)
     from .verification.verifiers import CompletionVerifier
-    task_completion = CompletionVerifier(args.task, completion_spec, private_completion_spec)
-    from .papers.paper_sources import default_paper_start_url
-    from .planning.task_specs import task_profile
-    args.browser_start_url = default_paper_start_url(args.task,
-        is_paper_download=task_profile(args.task, task_completion.public_spec)['kind'] == 'paper_download',
-        browser_start_url=args.browser_start_url)
+    task_completion = CompletionVerifier(args.task, completion_spec, private_completion_spec, task_mode=args.task_mode)
+    if args.task_mode == 'browser':
+        from .papers.paper_sources import default_paper_start_url
+        from .planning.task_specs import task_profile
+        args.browser_start_url = default_paper_start_url(args.task,
+            is_paper_download=task_profile(args.task, task_completion.public_spec)['kind'] == 'paper_download',
+            browser_start_url=args.browser_start_url)
 
     # 0) 屏幕分辨率：grounding 按它换算坐标，必须和真实屏幕一致
     if args.cli_only:
@@ -409,9 +417,11 @@ def main(platform: str = 'windows') -> int:
     print(f"[screen] 分辨率 {width}x{height}（检测到 {sw}x{sh}）")
 
     startup_started = time.perf_counter()
+    startup_phase = args.task_mode + '_startup'
     try:
-        log_status({"event": "task_start", "mode": "local", "instruction": args.task, "max_steps": args.max_steps})
-        log_status({"event": "phase_timing", "phase": "browser_startup", "phase_id": "startup", "step": 0,
+        log_status({"event": "task_start", "mode": "local", "task_mode": args.task_mode,
+                    "verification_backend": args.verification_backend, "instruction": args.task, "max_steps": args.max_steps})
+        log_status({"event": "phase_timing", "phase": startup_phase, "phase_id": "startup", "step": 0,
                     "status": "running", "started_at": time.time()})
     except Exception:
         pass  # Early telemetry cannot prevent the browser lifecycle from starting.
@@ -432,6 +442,8 @@ def main(platform: str = 'windows') -> int:
             from .adapters.cli_env import CLIEnvironment
             LocalEnvironment = CLIEnvironment
             started_chrome, chrome_profile = False, None
+        elif args.task_mode == 'desktop':
+            started_chrome, chrome_profile = False, None
         elif args.browser_session_mode == 'persistent':
             from .persistent_chrome import ensure_persistent_chrome, close_persistent_chrome
             started_chrome, chrome_profile = ensure_persistent_chrome(args.browser_port, args.chrome,
@@ -448,37 +460,53 @@ def main(platform: str = 'windows') -> int:
             started_chrome, chrome_profile = start_chrome(args.browser_port, args.chrome)
         dependency_report, dependency_ms = dependencies.result()
     _lifecycle_status({"event": "client_dependencies_ready", **dependency_report,
-                "elapsed_ms": dependency_ms, "overlap": "browser_startup"})
+                "elapsed_ms": dependency_ms, "overlap": startup_phase})
     env = None
     try:
         # Chrome starters already wait for the CDP endpoint. The adapter owns
         # page/window readiness; an unconditional two-second sleep adds no evidence.
 
         # 2) 模型（Logging 实时推送到 viz server）
-        model = LoggingChatModel(ChatModel(ModelConfig(name=args.model, url=args.model_url, api_key=args.model_api_key, temperature=args.temperature,
-            capture_rollout=args.capture_rollout, policy_revision=args.policy_revision,
-            tokenizer_revision=args.tokenizer_revision, processor_revision=args.processor_revision,
-            chat_template_revision=args.chat_template_revision)))
-        planner = (LoggingChatModel(ChatModel(ModelConfig(name=args.planner_model,
-            url=args.planner_url or args.model_url, api_key=args.model_api_key, temperature=args.temperature))) if args.planner_model else None)
-        verifier = (ChatModel(ModelConfig(name=args.verifier_model or args.model,
-            url=args.verifier_url or args.model_url, api_key=args.model_api_key, temperature=0, max_tokens=768,
-            timeout=45)) if args.verifier_model or args.verifier_url else None)
-        if args.ground_type == "qwen-plus":
-            from .adapters.qwen_grounding import QwenPlusGrounding as ground_cls
+        judge_options = judge_config_from_args(args)
+        if args.verification_backend == 'terra':
+            from .model.terra_verification import TerraAPI, TerraChat, TerraGrounding, TerraJudge
+            from .model.decision_judge import DecisionJudgeConfig
+            api = TerraAPI()
+            model = LoggingChatModel(TerraChat(api))
+            planner = LoggingChatModel(TerraChat(api, 'planner'))
+            verifier = TerraChat(api, 'verifier')
+            grounding = LoggingGrounding(TerraGrounding(api))
+            judge_config = DecisionJudgeConfig(**judge_options)
+            decision_judge = lambda: TerraJudge(api, judge_config, args.judge_selection_policy)
         else:
-            ground_cls = RealUItarsGrounding if args.ground_type == "ui-tars" else UIVenus2Grounding
-        grounding = LoggingGrounding(ground_cls(url=args.ground_url, api_key=args.ground_api_key,
-                                                       model=args.ground_model, width=width, height=height))
+            model = LoggingChatModel(ChatModel(ModelConfig(name=args.model, url=args.model_url, api_key=args.model_api_key, temperature=args.temperature,
+                capture_rollout=args.capture_rollout, policy_revision=args.policy_revision,
+                tokenizer_revision=args.tokenizer_revision, processor_revision=args.processor_revision,
+                chat_template_revision=args.chat_template_revision)))
+            planner = (LoggingChatModel(ChatModel(ModelConfig(name=args.planner_model,
+                url=args.planner_url or args.model_url, api_key=args.model_api_key, temperature=args.temperature))) if args.planner_model else None)
+            verifier = (ChatModel(ModelConfig(name=args.verifier_model or args.model,
+                url=args.verifier_url or args.model_url, api_key=args.model_api_key, temperature=0, max_tokens=768,
+                timeout=45)) if args.verifier_model or args.verifier_url else None)
+            if args.ground_type == "qwen-plus":
+                from .adapters.qwen_grounding import QwenPlusGrounding as ground_cls
+            else:
+                ground_cls = RealUItarsGrounding if args.ground_type == "ui-tars" else UIVenus2Grounding
+            grounding = LoggingGrounding(ground_cls(url=args.ground_url, api_key=args.ground_api_key,
+                                                   model=args.ground_model, width=width, height=height))
+            decision_judge = {**judge_options, 'selection_policy': args.judge_selection_policy}
+        grounding.allow_ocr_fallback = not args.disable_ocr_grounding
 
         # 3) 环境
         env_kwargs = {'browser_port': args.browser_port, 'width': width, 'height': height,
                       'downloads_dir': args.download_dir, 'window_timeout_s': args.window_timeout,
                       'browser_start_url': args.browser_start_url,
                       'browser_session_mode': args.browser_session_mode}
+        if platform == 'windows' and not args.cli_only:
+            env_kwargs.update(task_mode=args.task_mode, enable_desktop_ax=not args.disable_desktop_ax)
         env = LocalEnvironment(**env_kwargs)
 
-        log_status({"event": "phase_timing", "phase": "browser_startup", "phase_id": "startup", "step": 0,
+        log_status({"event": "phase_timing", "phase": startup_phase, "phase_id": "startup", "step": 0,
                     "status": "completed", "elapsed_ms": round((time.perf_counter()-startup_started)*1000, 2)})
         # 4) 组装 + 跑，保留 1010 的规划流水线
         agent = Agent(decision_model=model, grounding=grounding, env=env, mode_prompts=mode_prompts,
@@ -488,7 +516,8 @@ def main(platform: str = 'windows') -> int:
                       step_callback=_live_step, completion_spec=completion_spec,
                       private_completion_spec=private_completion_spec, planner_model=planner,
                       verifier_model=verifier,
-                      decision_judge={**judge_config_from_args(args), 'selection_policy': args.judge_selection_policy},
+                      decision_judge=decision_judge,
+                      run_manifest={'task_mode': args.task_mode, 'verification_backend': args.verification_backend},
                       event_path=os.path.join(args.result_dir, log_name("events.jsonl")) if args.result_dir else None)
         if args.result_dir:
             set_results_dir(args.result_dir, args.run_prefix or '')

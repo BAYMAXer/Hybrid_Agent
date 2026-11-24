@@ -1,13 +1,7 @@
-"""Windows 本机环境：pyautogui 控制桌面 + CDP 控制浏览器。
+"""Windows 本机任务环境。
 
-用于在 Windows 本机（非 VM）上跑 GUI agent 任务，重点支持 browser use：
-- 观察：后台 CDP 页面截图与 AX；显式桌面观察使用 Win32/Pillow 全虚拟桌面截图；
-- 执行：桌面 GUI 动作（click/type/hotkey 等）走 pyautogui（坐标定位）；
-        浏览器 DOM 动作（带 target_ref / 语义兜底命中）走 CDP（DOM 定位，跳过视觉定位）；
-- 焦点检测走 Windows GetForegroundWindow。
-
-与 VMwareEnvironment 的对齐点：browser_ax 快照进 context、target_ref 路由 + 语义兜底、
-execute_routed 走 CDP。差异点：CDP host 是 localhost，桌面使用物理像素坐标，无 AT-SPI。
+desktop 从物理桌面、当前窗口和可选的 HCU 原生 AX 开始。browser 使用任务浏览器
+的 CDP 会话，支持既有的桌面接管操作。两种入口共享框架的观察和动作接口。
 """
 from __future__ import annotations
 
@@ -16,7 +10,11 @@ import subprocess
 import sys
 import math
 import threading
+import time
+import uuid
+import weakref
 from contextlib import contextmanager
+from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, Optional
 
 from ..env import Environment, Observation, StepResult
@@ -27,14 +25,25 @@ from .vmware_env import to_pyautogui
 class WindowsEnvironment(Environment):
     cli_target = "local"
 
-    """Windows 本机环境（GUI + browser use）。"""
-
     evaluation_available = False
 
     def __init__(self, browser_port: int = 9222, width: int = 1920, height: int = 1080,
                  downloads_dir: Optional[str] = None, workspace_dir: Optional[str] = None,
                  window_timeout_s: float = 15.0, browser_start_url: Optional[str] = None,
-                 browser_session_mode: str = "isolated"):
+                 browser_session_mode: str = "isolated", task_mode: str = "browser",
+                 enable_desktop_ax: bool = True):
+        if task_mode not in {"browser", "desktop"}:
+            raise ValueError('WindowsEnvironment task_mode must be browser or desktop')
+        self.task_mode = task_mode
+        self._desktop_lock = threading.RLock()
+        self._desktop_ax = None
+        self._desktop_stop = None
+        self._desktop_lease = None
+        self._captured_layouts = ()
+        self._desktop_intent_task = None
+        self._protect_new_file = False
+        self._allowed_existing_names = set()
+        self._enable_desktop_ax = enable_desktop_ax
         if not isinstance(browser_session_mode, str) or browser_session_mode not in {"isolated", "persistent"}:
             raise ValueError('browser_session_mode must be isolated or persistent')
         self.browser_session_mode = browser_session_mode
@@ -51,7 +60,7 @@ class WindowsEnvironment(Environment):
         self.width = width
         self.height = height
         self.os_name = "windows"
-        self.browser_only = True  # 浏览器专用：用精简 system prompt + 强化 DOM 定位
+        self.browser_only = task_mode == "browser"
         self.downloads_dir = downloads_dir
         self.workspace_dir = workspace_dir
         self.browser_start_url = browser_start_url
@@ -59,7 +68,7 @@ class WindowsEnvironment(Environment):
             raise ValueError('workspace_dir 与 downloads_dir 不能同时指定')
         self._browser_session = None
         self._last_observation_info = {}
-        self._observation_surface = "browser"
+        self._observation_surface = task_mode
         self._episode_prepared = False
         self.initial_state = {}
         self._desktop_capture = {}
@@ -67,11 +76,41 @@ class WindowsEnvironment(Environment):
     def prepare_workspace(self, task_id=None):
         if self._episode_prepared:
             return dict(self.initial_state)
+        if self.task_mode == "desktop":
+            from ..runtime.workspace_config import default_workspace_root
+            from ..runtime.cli_executor import cli_capability
+            root = Path(self.workspace_dir or self.downloads_dir or default_workspace_root(prefer_env=True)).expanduser().resolve()
+            directory = root / time.strftime("%Y-%m-%d")
+            directory.mkdir(exist_ok=True, parents=True)
+            self.initial_state = {"episode_id": task_id or uuid.uuid4().hex, "task_mode": "desktop",
+                                  "workspace_dir": str(directory), "workspace_root": str(root),
+                                  "workspace_location": "target_desktop", "workspace_scope": "day"}
+            self.initial_state["cli_capability"] = cli_capability(self)
+            return dict(self.initial_state)
         self.initial_state = self._get_browser_session().prepare_workspace(task_id)
         self.initial_state['workspace_location'] = 'target_desktop'
         return dict(self.initial_state)
 
     def begin_episode(self, task_id=None, isolated=True):
+        if self.task_mode == "desktop":
+            with self._desktop_lock:
+                from ..desktop.hcu_ax import DesktopAX
+                self._episode_prepared = False
+                self.prepare_workspace(task_id or self.initial_state.get("episode_id"))
+                if self._desktop_ax:
+                    self._desktop_ax.close()
+                self._desktop_ax = DesktopAX(self._enable_desktop_ax)
+                self._desktop_stop = None
+                self._observation_surface = "desktop"
+                self._desktop_capture = {}
+                self._last_observation_info = {}
+                self._captured_layouts = ()
+                self._pending_window = self._last_window_wait = None
+                self._window_launch_inflight = False
+                self._window_wait_cancel.clear()
+                self._ensure_desktop_lease()
+                self._episode_prepared = True
+                return dict(self.initial_state)
         session = self._get_browser_session()
         self.initial_state = session.begin_episode(task_id=task_id, isolated=isolated,
             viewport={"width": self.width, "height": self.height}, start_url=self.browser_start_url)
@@ -92,6 +131,29 @@ class WindowsEnvironment(Environment):
         self._window_wait_cancel.clear()
         return dict(self.initial_state)
 
+    def _ensure_desktop_lease(self):
+        if self._desktop_lease is None and sys.platform == "win32" and self.task_mode == "desktop":
+            from ..desktop.desktop_capture import acquire_desktop_lease
+            self._desktop_lease = weakref.finalize(self, acquire_desktop_lease())
+
+    def set_desktop_file_intent(self, task, checks=()):
+        self._desktop_intent_task = task
+        files = [c for c in checks or () if isinstance(c, dict) and c.get("kind") == "desktop_file"]
+        created = {PureWindowsPath(c["path"]).name.casefold() for c in files if c.get("change") == "created" and c.get("path")}
+        modified = {PureWindowsPath(c["path"]).name.casefold() for c in files if c.get("change") == "modified" and c.get("path")}
+        text = str(task or "")
+        asks_new = (bool(re.search(r"新建|新的.{0,10}文件|创建.{0,15}文件|\bnew\b.{0,18}\bfile\b", text, re.I))
+                    and not re.search(r"(?:不要|无需|不得|勿)(?:新建|创建)|\b(?:not|never|don't) create\b", text, re.I))
+        forbids_overwrite = bool(re.search(r"(?:不(?:要|得|允许)?|禁止|勿)覆盖|\b(?:never|not|don't)\s+overwrite\b", text, re.I))
+        allows_overwrite = bool(re.search(r"允许覆盖|覆盖(?:已有|原文件|现有)|替换现有文件|\boverwrite\b", text, re.I))
+        self._protect_new_file = bool(created or forbids_overwrite or (asks_new and not allows_overwrite))
+        self._allowed_existing_names = set() if forbids_overwrite else modified - created
+
+    def _overwrite_protected(self, text):
+        return self._protect_new_file and not any(
+            re.search(r"(?<![\w.-])" + re.escape(name) + r"(?![\w.-])", text.casefold())
+            for name in self._allowed_existing_names)
+
     @contextmanager
     def framework_wait_context(self, emit, remaining):
         old = self._window_wait_emit, self._window_wait_remaining
@@ -109,7 +171,8 @@ class WindowsEnvironment(Environment):
         self._pending_window = target
         report = wait_for_window(target, timeout_s=self.window_timeout_s,
             emit=self._window_wait_emit, remaining=self._window_wait_remaining,
-            cancelled=self._window_wait_cancel.is_set)
+            cancelled=self._window_wait_cancel.is_set,
+            read_state=self._runtime_state if self.task_mode == 'desktop' else None)
         self._last_window_wait = report
         if report['status'] == 'completed':
             self._pending_window = None
@@ -130,13 +193,29 @@ class WindowsEnvironment(Environment):
 
     def _runtime_state(self):
         from ..desktop.desktop_state import windows_runtime_state
-        return windows_runtime_state()
+        return windows_runtime_state(include_layout=self.task_mode == "desktop")
+
+    def _desktop_is_input(self):
+        from ..desktop.desktop_capture import input_desktop_active
+        return input_desktop_active()
+
+    def _inactive_observation(self):
+        self._desktop_capture = {}
+        self._captured_layouts = ()
+        if self._desktop_ax:
+            self._desktop_ax.invalidate()
+        self._last_observation_info = {"task_mode": "desktop", "active_surface":"desktop",
+            "screenshot_stale":True, "observation_error":"任务桌面当前不可输入，请等待桌面恢复后再观察",
+            "desktop_ax_status":"input_desktop_inactive", "initial_state":dict(self.initial_state)}
+        return Observation(info=self._last_observation_info)
 
     def _focus_is_browser(self) -> bool:
         """本机浏览器模式：以「CDP 有可用页面」为准，不依赖前台焦点。
 
         用户可同时用电脑（切到别的窗口），智能体照常通过 CDP 虚拟控制浏览器。
         """
+        if self.task_mode == "desktop":
+            return False
         from ..browser.utils import list_cdp_pages
         try:
             pages = list_cdp_pages("localhost", self.browser_port)
@@ -151,6 +230,8 @@ class WindowsEnvironment(Environment):
         require_focus=False：本机模式用 CDP 虚拟输入，不要求浏览器前台聚焦——
         这样智能体操作浏览器时，你可以照常用自己的鼠标键盘。
         """
+        if self.task_mode == "desktop":
+            return None
         if self._browser_session is None:
             from ..browser.browser_session import BrowserSession, BrowserOptions
             self._browser_session = BrowserSession(
@@ -183,6 +264,8 @@ class WindowsEnvironment(Environment):
         """
         from ..model.grounding import screenshot_size
         from ..runtime.scene import Scene, browser_scene
+        if self.task_mode == "desktop" and not self._desktop_is_input():
+            return self._inactive_observation()
 
         from ..desktop.desktop_readiness import foreground, window_identity
         desktop_before = self._runtime_state() if self._observation_surface == 'desktop' else None
@@ -202,7 +285,7 @@ class WindowsEnvironment(Environment):
                 if screenshot is not None and metadata.get("screenshot_space") == "css_viewport":
                     break
                 _time.sleep(0.25)
-        else:
+        elif self.task_mode != "desktop":
             try:
                 session = self._get_browser_session()
                 if session is not None and hasattr(session, "event_metadata"):
@@ -231,7 +314,11 @@ class WindowsEnvironment(Environment):
             context = [snapshot] if snapshot else []
         else:
             # 桌面模式：显式 observe_desktop 才截取全部显示器。
-            screenshot = self._take_screenshot()
+            try:
+                screenshot = self._take_screenshot()
+            except (OSError, RuntimeError) as exc:
+                error = str(exc)
+                self._desktop_capture = {}
             size = screenshot_size(screenshot)
             info = {"screenshot_space": "screen_pixels",
                     "screenshot_size": list(size) if size else None,
@@ -250,13 +337,56 @@ class WindowsEnvironment(Environment):
         info["active_surface"] = "browser" if info.get("screenshot_space") == "css_viewport" else "desktop"
         info["requested_surface"] = self._observation_surface
         info['control_mode'] = 'background_browser' if info['active_surface'] == 'browser' else 'desktop_takeover'
+        info["task_mode"] = self.task_mode
+        ax_block, ax_reason = None, ""
+        if self.task_mode == "desktop" and self._desktop_ax:
+            ax_block, ax_reason = self._desktop_ax.observe(foreground(desktop_before or {}),
+                                                           info.get("desktop_capture_id"))
         info["runtime_state"] = self._runtime_state()
+        if self.task_mode == "desktop" and not self._desktop_is_input():
+            return self._inactive_observation()
         if desktop_before is not None:
             before, after = foreground(desktop_before), foreground(info['runtime_state'])
             info['desktop_focus_stable'] = bool(before and after and window_identity(before) == window_identity(after))
+            if self.task_mode == "desktop":
+                from ..desktop.hcu_ax import browser_window
+                from ..desktop.desktop_state import common_file_dialog
+                self._captured_layouts = tuple(layout for layout in (
+                    desktop_before.pop("_window_layout", None), info["runtime_state"].pop("_window_layout", None))
+                    if layout is not None)
+                info['control_mode'] = 'desktop'
+                info['desktop_browser_foreground'] = browser_window(after)
+                info['desktop_focus_stable'] = bool(info['desktop_focus_stable'] and before.get("title") == after.get("title"))
+                kind, confirmation_text = common_file_dialog(after, ax_block if info['desktop_focus_stable'] else None)
+                info["desktop_file_dialog"] = kind == "picker"
+                info["desktop_overwrite_protected"] = kind == "overwrite" and self._overwrite_protected(confirmation_text)
+                if ax_block and (info["desktop_file_dialog"] or info["desktop_overwrite_protected"]):
+                    # Win32 common-dialog UIA SetValue can update the display
+                    # without updating the shell's selected file. Use real keyboard
+                    # and pointer messages for this dialog, and retain read evidence.
+                    ax_block["read_only"] = True
+                    for node in ax_block["nodes"]:
+                        node.update(direct=False, actions=[])
+                if ax_block and info['desktop_focus_stable']:
+                    context.append(ax_block)
+                    info["scene"] = Scene(browser_use=0, structure_available=True, mode="desktop_ax",
+                                          reason="native_window_observed").to_dict()
+                elif self._desktop_ax:
+                    self._desktop_ax.invalidate()
+                info['desktop_ax_status'] = ('available' if context else ax_reason or 'foreground_changed')
+                if self._pending_window and (self._last_window_wait or {}).get('status') == 'timeout':
+                    from ..desktop.desktop_readiness import matches_target, window_ready
+                    if (info['desktop_focus_stable'] and window_ready(before) and window_ready(after)
+                            and before['bounds'] == after['bounds'] and matches_target(after, self._pending_window)):
+                        self._last_window_wait = {**self._last_window_wait, 'status': 'completed', 'window': dict(after),
+                            'detail': '先前等待超时，新的桌面截图前后已确认目标窗口在前台且可接收输入'}
+                        self._pending_window = None
+                        self._window_launch_inflight = False
             if self._last_window_wait:
                 info['desktop_window_wait'] = dict(self._last_window_wait)
-        self._last_observation_info = dict(info)
+        # The compiler attaches the actually exposed native refs to this exact
+        # observation after truncating the decision prompt.
+        self._last_observation_info = info if self.task_mode == "desktop" else dict(info)
         return Observation(screenshot=screenshot, text="", context=context, info=info)
 
     def _derive_scene(self, snapshot, screenshot=None):
@@ -285,6 +415,16 @@ class WindowsEnvironment(Environment):
         流程：DOM（element_id / target_ref / 语义匹配）→ 命中走 CDP；都没命中返回 None，
         交给 pipeline 用 grounding 模型定坐标，再由 step() 用 CDP 虚拟坐标点击（仍不动真实鼠标）。
         """
+        if self.task_mode == "desktop":
+            with self._desktop_lock:
+                if action.args.get("target_ref") and ((obs and obs.info.get("desktop_file_dialog"))
+                                                       or self._last_observation_info.get("desktop_overwrite_protected")):
+                    return {"channel":"reobserve","source":"desktop_ax","error_code":"desktop_dialog_requires_gui",
+                            "reason":"文件对话框使用可见按钮和真实键盘；新建文件遇到覆盖确认请按 Esc 返回"}
+                if action.args.get("target_ref") and not self._desktop_ax:
+                    return {"channel": "reobserve", "source": "desktop_ax", "error_code": "stale_desktop_ref",
+                            "reason": "原生 AX 未就绪，请重新观察"}
+                return self._desktop_ax.route(action, obs) if self._desktop_ax else None
         if obs is None or action.action not in self._BROWSER_CDP_ACTIONS:
             return None
         # Route against the actual observation, not a fresh CDP page guess.
@@ -361,6 +501,8 @@ class WindowsEnvironment(Environment):
         return None
 
     def prevent_duplicate_download(self, action, observation, route=None):
+        if self.task_mode == "desktop":
+            return None
         session = self._get_browser_session()
         if session is None:
             return None
@@ -368,6 +510,33 @@ class WindowsEnvironment(Environment):
 
     def execute_routed(self, action, route):
         """执行已路由的 browser_dom 动作：goto / DOM(ref) / scroll/press/hotkey 全部走 CDP。"""
+        if self.task_mode == "desktop":
+            from ..desktop.desktop_readiness import foreground
+            with self._desktop_lock:
+                self._ensure_desktop_lease()
+                if self._desktop_stop:
+                    return StepResult(self.observe(), done=True, info=dict(self._desktop_stop))
+                if (self._last_observation_info.get("desktop_file_dialog")
+                        or self._last_observation_info.get("desktop_overwrite_protected")):
+                    return StepResult(self.observe(), info={"channel":"desktop_ax","status":"rejected",
+                                      "dispatched":False,"error_code":"desktop_dialog_requires_gui"})
+                exposed = ((self._last_observation_info.get("exposed_refs") or ())
+                           if "exposed_refs" in self._last_observation_info else None)
+                if exposed is not None and route.get("target_ref") not in exposed:
+                    return StepResult(self.observe(), info={"channel":"desktop_ax","status":"rejected",
+                                      "dispatched":False,"error_code":"unexposed_desktop_ref"})
+                if route.get("channel") != "desktop_ax" or not self._desktop_ax:
+                    return StepResult(self.observe(), info={"channel": "desktop_ax", "status": "rejected",
+                                      "dispatched": False, "error_code": "unavailable_desktop_route"})
+                if self._window_wait_cancel.is_set() or (self._window_wait_remaining and self._window_wait_remaining() <= 0):
+                    return StepResult(self.observe(), info={"channel": "desktop_ax", "status": "rejected",
+                                      "dispatched": False, "error_code": "desktop_operation_cancelled"})
+                result = self._desktop_ax.execute(action, route, lambda:
+                    foreground(self._runtime_state()) if self._desktop_is_input() else None)
+                if (result.get("continuation") or {}).get("state") == "stop":
+                    self._desktop_stop = result
+                    return StepResult(self._stopped_observation(), done=True, info=result)
+                return StepResult(self.observe(), info=result)
         if action.action in {"download", "rename_artifact", "run_in_terminal", "call_code_agent", "set_cell_values", "save"}:
             return StepResult(self.observe(), info={"status": "rejected", "dispatched": False,
                 "error_code": "non_basic_action", "action": action.action})
@@ -393,21 +562,86 @@ class WindowsEnvironment(Environment):
 
     # ---- Environment 接口 ----
     def reset(self, task: str) -> Observation:
+        if self.task_mode == "desktop" and self._desktop_intent_task != task:
+            self.set_desktop_file_intent(task)
         if not self._episode_prepared:
             self.begin_episode()
         self._episode_prepared = False
         return self.observe()
 
     def observe(self) -> Observation:
+        if self.task_mode == "desktop":
+            with self._desktop_lock:
+                return self._stopped_observation() if self._desktop_stop else self._build_observation()
         return self._build_observation()
 
+    def _stopped_observation(self):
+        return Observation(info={"task_mode": "desktop", "active_surface": "desktop", "screenshot_stale": True,
+                                 "observation_error": "HCU 已指示停止，本次任务无法继续观察", "initial_state": self.initial_state})
+
     def step(self, action: Action) -> StepResult:
+        if self.task_mode == "desktop":
+            with self._desktop_lock:
+                self._ensure_desktop_lease()
+                if self._desktop_stop:
+                    return StepResult(self._stopped_observation(), done=True, info=dict(self._desktop_stop))
+                return self._step(action)
+        return self._step(action)
+
+    def _step(self, action: Action) -> StepResult:
         name = action.action
         if name not in BASIC_ACTIONS:
             return StepResult(self.observe(), info={"status": "rejected", "dispatched": False,
                 "error_code": "non_basic_action", "action": name})
         spec = get_action_spec(name)
         kind = spec.kind if spec else "env"
+        if self.task_mode == "desktop":
+            from ..desktop.desktop_readiness import foreground, global_shortcut
+            from ..desktop.hcu_ax import browser_window
+            if name not in {"observe_desktop", "wait"} and not self._desktop_is_input():
+                return StepResult(self._inactive_observation(), info={"status":"rejected", "dispatched":False,
+                                  "error_code":"input_desktop_inactive", "channel":"desktop"})
+            allowed = {"observe_desktop", "click", "double_click", "right_click", "type", "select", "scroll",
+                       "press", "hotkey", "drag_and_drop", "switch_applications", "wait"}
+            if (self._last_observation_info.get("desktop_overwrite_protected") and name not in {"observe_desktop","wait"}
+                    and not (name == "press" and str(action.args.get("key", "")).casefold() in {"esc","escape"})):
+                return StepResult(self.observe(), info={"status":"rejected","dispatched":False,"channel":"desktop",
+                                  "error_code":"unexpected_file_overwrite","reason":"新建任务出现覆盖确认，请按 Esc 并核对实际文件名"})
+            if name not in allowed or action.args.get("element_id") or action.args.get("target_ref") or action.args.get("coordinate_space") == "css_viewport":
+                return StepResult(self.observe(), info={"status": "rejected", "dispatched": False,
+                                  "error_code": "desktop_scope", "channel": "desktop"})
+            if name == "switch_applications":
+                from ..desktop.desktop_state import windows_application_process
+                if windows_application_process(action.args.get("app_code")) in {"chrome", "msedge", "firefox", "brave", "opera", "vivaldi", "chromium", "iexplore", "arc"}:
+                    return StepResult(self.observe(), info={"status": "rejected", "dispatched": False,
+                                      "error_code": "browser_task_out_of_scope", "channel": "desktop"})
+            if name not in {"observe_desktop", "wait", "switch_applications"} and not global_shortcut(action):
+                current_state = self._runtime_state()
+                current, previous = foreground(current_state), foreground(self._last_observation_info.get("runtime_state", {}))
+                from ..desktop.desktop_readiness import window_identity
+                leaving_browser = browser_window(current)
+                if leaving_browser and name not in {"click", "double_click"}:
+                    return StepResult(self.observe(), info={"status": "rejected", "dispatched": False,
+                                      "error_code": "browser_task_out_of_scope", "channel": "desktop"})
+                if (not self._last_observation_info.get("desktop_focus_stable") or not current or
+                        window_identity(current) != window_identity(previous) or current.get("title") != previous.get("title")):
+                    return StepResult(self.observe(), info={"status": "rejected", "dispatched": False,
+                                      "error_code": "desktop_focus_changed", "channel": "desktop"})
+                if name in {"click", "double_click", "right_click", "drag_and_drop", "type", "select", "scroll"}:
+                    from ..desktop.desktop_state import pointer_guard
+                    browser_handles = {w["hwnd"] for w in current_state.get("applications", []) if w.get("hwnd") and browser_window(w)}
+                    try:
+                        if self._captured_layouts and "_window_layout" not in current_state:
+                            raise OSError("无法核实目标窗口位置")
+                        layouts = (*self._captured_layouts, current_state["_window_layout"]) if "_window_layout" in current_state else ()
+                        guard_error = pointer_guard(action, self._desktop_capture.get("screen_origin", [0, 0]), browser_handles,
+                                                    layouts, leaving_browser=leaving_browser)
+                    except OSError:
+                        return StepResult(self.observe(), info={"status": "rejected", "dispatched": False,
+                                          "error_code": "desktop_pointer_unconfirmed", "channel": "desktop"})
+                    if guard_error:
+                        return StepResult(self.observe(), info={"status": "rejected", "dispatched": False,
+                                          "error_code": guard_error, "channel": "desktop"})
         if name in {"observe_desktop", "observe_browser"}:
             self._observation_surface = "desktop" if name == "observe_desktop" else "browser"
             obs = self.observe()
@@ -479,7 +713,6 @@ class WindowsEnvironment(Environment):
                     result.pop('error_code', None)
             return StepResult(observation=self.observe(), info=result)
         from ..desktop.desktop_readiness import launch_target, global_shortcut, check_keyboard_focus, DesktopFocusError
-        from ..desktop.desktop_state import windows_runtime_state
         target = launch_target(action) if sys.platform == 'win32' else None
         if target and self._window_launch_inflight and self._pending_window and self._pending_window.get('process_name') == target['process_name']:
             # A previous launch may still be completing. Never create more windows.
@@ -489,7 +722,7 @@ class WindowsEnvironment(Environment):
                           and not global_shortcut(action))
         observed = self._last_observation_info
         def guard_input():
-            check_keyboard_focus(observed.get('runtime_state', {}), windows_runtime_state(),
+            check_keyboard_focus(observed.get('runtime_state', {}), self._runtime_state(),
                 pending_target=self._pending_window, capture_stable=observed.get('desktop_focus_stable') is True)
         if keyboard_guard:
             try:
@@ -504,7 +737,8 @@ class WindowsEnvironment(Environment):
             if self._desktop_capture:
                 from ..desktop.desktop_capture import validate_desktop_action, virtual_geometry
                 mapped, origin = validate_desktop_action(action, self._desktop_capture, virtual_geometry())
-                cmd = to_pyautogui(mapped, desktop_origin=origin, keyboard_guard=keyboard_guard)
+                cmd = to_pyautogui(mapped, desktop_origin=origin, keyboard_guard=keyboard_guard,
+                                   literal_click=self.task_mode == "desktop")
             else:
                 cmd = to_pyautogui(action, keyboard_guard=keyboard_guard)
         except (ValueError, OSError) as exc:
@@ -514,6 +748,9 @@ class WindowsEnvironment(Environment):
             try:
                 from ..desktop.desktop_capture import physical_dpi_context
                 with physical_dpi_context():
+                    if self.task_mode == "desktop" and name != "wait" and not self._desktop_is_input():
+                        return StepResult(self._inactive_observation(), info={"status":"rejected", "dispatched":False,
+                                          "error_code":"input_desktop_inactive", "channel":"desktop"})
                     exec(cmd, {"__name__": "__main__", "desktop_input_guard": guard_input})  # noqa: S102
             except DesktopFocusError as exc:
                 return StepResult(observation=self.observe(), info={'status': 'uncertain', 'dispatched': True,
@@ -591,6 +828,19 @@ class WindowsEnvironment(Environment):
         return 0.0
 
     def close(self) -> None:
+        with self._desktop_lock:
+            try:
+                if self._desktop_ax is not None:
+                    self._desktop_ax.close()
+            finally:
+                self._desktop_ax = None
+                self._desktop_capture = {}
+                self._captured_layouts = ()
+                self._last_observation_info = {}
+                self._episode_prepared = False
+                if self._desktop_lease is not None:
+                    self._desktop_lease()
+                    self._desktop_lease = None
         if self._browser_session is not None:
             try:
                 self._browser_session.close()

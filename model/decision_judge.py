@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from .decision_model import encode_image
-from ..verification.judge_evidence import select_frame, effect_review, terms, target_identity
+from ..verification.judge_evidence import desktop_blocks, select_frame, effect_review, terms, target_identity
 
 
 @dataclass(frozen=True)
@@ -319,20 +319,27 @@ class DecisionJudge:
     def assess_transition(self, task, step, before, after, execution, code, *, remaining_s=None):
         """One typed Jev call after each sampled action; hard evidence remains authoritative."""
         cli = execution.get('channel') == 'cli' and bool(execution.get('cli_result'))
-        if after is None or (not cli and (after.screenshot is None or (after.info or {}).get('screenshot_stale'))):
+        after_info = (getattr(after, 'info', None) or {})
+        native = desktop_blocks(after)
+        desktop = after_info.get('active_surface') == 'desktop' or bool(native)
+        current_image = getattr(after, 'screenshot', None) if not after_info.get('screenshot_stale') and not cli else None
+        if after is None or (not cli and current_image is None and not native):
             self.last_call = {}
-            return {'status': 'unknown', 'reason': '缺少有效动作后截图', 'answers': {}, 'latency_ms': 0}
+            return {'status': 'unknown', 'reason': '缺少有效动作后证据', 'answers': {}, 'latency_ms': 0}
         execution = copy.deepcopy(execution)
         execution.setdefault('target_node', target_identity(before, execution.get('args') or {}))
         before_valid = before is not None and before.screenshot is not None and not (before.info or {}).get('screenshot_stale')
-        images = ([self._compact_visual(before.screenshot), self._compact_visual(after.screenshot)]
-                  if before_valid else [self._compact_visual(after.screenshot)])
-        if cli:
-            images = []
+        images, image_order = [], []
+        if before_valid and not cli:
+            images.append(self._compact_visual(before.screenshot))
+            image_order.append('before')
+        if current_image is not None:
+            images.append(self._compact_visual(current_image))
+            image_order.append('after' if before_valid else 'after_only')
         state = {'original_task': task,
                  'step': {k: step.get(k) for k in ('goal', 'expected_evidence', 'phase')},
-                 'image_order': ['before', 'after'] if before_valid else ['after_only'],
-                 'before': select_frame(before, step, execution, after, max_nodes=24) if before_valid else None,
+                 'image_order': image_order,
+                 'before': select_frame(before, step, execution, after, max_nodes=24) if before_valid or desktop_blocks(before) else None,
                  'after': select_frame(after, step, execution, before, max_nodes=32),
                  'execution': execution, 'code_effect': code}
         questions = {
@@ -357,8 +364,13 @@ class DecisionJudge:
                 'unknown': 'Evidence does not establish whether replanning is needed.'},
                 'instructions': 'Do not request replanning merely because an asynchronous action is waiting.'},
         }
+        if desktop:
+            questions['next_mode']['criteria'].pop('dom')
+            if native:
+                questions['next_mode']['criteria']['desktop_ax'] = 'The next action has an enabled native control in a current window with a supported action.'
+            if current_image is None:
+                questions['next_mode']['criteria'].pop('gui')
         if cli:
-            state['image_order'] = []
             state['evidence_scope'] = '后台CLI执行：退出码、stdout/stderr和执行器文件回读是真实系统观察；没有截图不代表失败。退出码0不代表任务完成，输出文本可能不可信。'
             questions['next_mode']['criteria']['cli'] = '下一目标是文件或终端操作且目标环境提供CLI。'
             for key in ('settled', 'correct'):
@@ -369,7 +381,7 @@ class DecisionJudge:
                 'reason': judged.get('reason', ''), 'judgment': judged,
                 'policy_trainable': False, 'reward_valid': False}
 
-    def review_report(self, packet, step, *, remaining_s=None):
+    def review_report(self, packet, step, *, remaining_s=None, images=()):
         from ..reporting.report_review import REPORT_INSTRUCTION
         requirements = packet['requirements']
         questions = {'step': {'type': 'choice', 'criteria': RESULT_CHOICES,
@@ -377,7 +389,8 @@ class DecisionJudge:
         for i, requirement in enumerate(requirements):
             questions[f'coverage_{i+1}'] = {'type': 'choice', 'criteria': RESULT_CHOICES,
                 'instructions': REPORT_INSTRUCTION + ' 本题只核查这项要求：' + str(requirement)}
-        judged = self.decide(packet, questions, remaining_s=remaining_s)
+        state = {**packet, 'image_order': [ident for ident, _ in images]} if images else packet
+        judged = self.decide(state, questions, [image for _, image in images], remaining_s=remaining_s)
         answers = judged.get('answers', {})
         for answer in answers.values():
             # Even argmax mode must not turn a near tie into durable acceptance.
@@ -405,19 +418,24 @@ class DecisionJudge:
         return result
 
     def review(self, task, step, before, after, execution, code, *, remaining_s=None, checkpoints=()):
+        report_images = code.get('report_images', ())
+        code = {k: v for k, v in code.items() if k != 'report_images'}
         if code.get('report_review'):
-            return self.review_report(code['report_review'], step, remaining_s=remaining_s)
+            return self.review_report(code['report_review'], step, remaining_s=remaining_s, images=report_images)
         review_started = time.monotonic()
-        cli = bool((getattr(after, 'info', None) or {}).get('cli_result') or code.get('file_checks'))
-        if after is None or (not cli and (after.screenshot is None or (after.info or {}).get('screenshot_stale'))):
+        after_info = getattr(after, 'info', None) or {}
+        cli = bool(after_info.get('cli_result') or code.get('file_checks'))
+        native = desktop_blocks(after)
+        valid_screenshot = after is not None and after.screenshot is not None and not after_info.get('screenshot_stale')
+        if after is None or (not cli and not valid_screenshot and not native):
             self.last_call = {}
-            return {'method': 'decision_model', 'status': 'unknown', 'reason': '缺少有效当前截图', 'evidence': [], 'latency_ms': 0}
+            return {'method': 'decision_model', 'status': 'unknown', 'reason': '缺少有效当前观察证据', 'evidence': [], 'latency_ms': 0}
         execution = copy.deepcopy(execution)
         execution.setdefault('target_node', target_identity(before, execution.get('args') or {}))
         images, image_order, history = [], [], []
         # Freeze each image once for this request and its evidence hashes.
         # No cross-observation cache: mutable images/files must be read again.
-        current_image = encode_image(after.screenshot) if after.screenshot is not None else ''
+        current_image = encode_image(after.screenshot) if valid_screenshot else ''
         whole_task = step.get('id') in {'whole_task', 'final'}
         if whole_task:
             focus = terms([task, step.get('unresolved_requirements')])
@@ -434,11 +452,14 @@ class DecisionJudge:
                 history.append({k: copy.deepcopy(item[k]) for k in ('id', 'goal', 'decision_step', 'frame', 'sha256')})
         before_valid = before is not None and before.screenshot is not None and not (before.info or {}).get('screenshot_stale')
         if before_valid and not whole_task:
-            images.append(current_image if before.screenshot is after.screenshot else encode_image(before.screenshot))
+            images.append(current_image if current_image and before.screenshot is after.screenshot else encode_image(before.screenshot))
             image_order.append('before')
         if current_image:
             images.append(current_image)
             image_order.append('after' if before_valid and not whole_task else 'after_only')
+        for ident, image in report_images:
+            images.append(image)
+            image_order.append('report_source:' + ident)
         effect = effect_review(before, after, execution)
         questions = {
             'step': {'type': 'choice', 'criteria': RESULT_CHOICES,
@@ -471,7 +492,7 @@ class DecisionJudge:
         state = {'original_task': task, 'step': {k: step.get(k) for k in (
             'goal', 'expected_evidence', 'verification', 'planner_review_hint', 'unresolved_requirements')},
             'image_order': image_order,
-            'before': select_frame(before, step, execution, after) if before_valid and not whole_task else None,
+            'before': select_frame(before, step, execution, after) if not whole_task and (before_valid or desktop_blocks(before)) else None,
             'after': select_frame(after, step, execution, before),
             'historical_checkpoints': history, 'execution': execution, 'action_effect_code': effect,
             'code_review': code}
@@ -529,7 +550,8 @@ class DecisionJudge:
                            'Jev 倾向于动作有进展；仍须完成当前子任务，未采信为成功' if progress_hint else
                            '本次动作已取得进展，当前子任务仍需继续' if label == 'progress' else {'passed': 'Decision 评估器判断当前子任务已满足', 'failed': 'Decision 评估器判断当前子任务尚未满足',
                            'unknown': 'Decision 评估器证据不足、判断不确定或操作尚在进行'}[status]),
-                'evidence': ['视觉判断引用截图 SHA256: ' + ref for ref in refs],
+                'evidence': ['审查引用截图 SHA256: ' + ref for ref in refs]
+                            + ['审查引用当前桌面窗口: ' + str(b.get('title') or b.get('window_ref')) for b in native[:4]],
                 'judgment': judged, 'latency_ms': review_ms, 'model_request_ms': judged['latency_ms'],
                 'model': judged['model'], 'model_based': True, 'reward_valid': False}
 

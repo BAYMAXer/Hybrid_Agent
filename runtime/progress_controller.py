@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from ..env import Observation
+from ..verification.judge_evidence import desktop_blocks, visible_native_node
 from .pipeline_types import Decision, Execution, StepState
 
 
@@ -67,10 +68,17 @@ def _clear_stall(state):
 def _semantic_observation(obs):
     if obs is None:
         return None
-    return [{"kind": block.get("kind"), "url": block.get("url"),
-             "nodes": [{k: n[k] for k in ("role", "name", "value", "checked", "selected", "expanded", "focused", "disabled", "states", "href", "url") if k in n}
-                       for n in block.get("nodes", [])]}
-            for block in obs.context if block.get("kind") == "browser_ax"]
+    fields = ("role", "name", "value", "checked", "selected", "expanded", "focused", "disabled", "states", "href", "url")
+    observed = [{"kind": block.get("kind"), "url": block.get("url"),
+                 "nodes": [{k: node[k] for k in fields if k in node} for node in block.get("nodes", [])]}
+                for block in obs.context if block.get("kind") == "browser_ax"]
+    for block in desktop_blocks(obs):
+        # HCU refs are leases for input, not durable identities for review.
+        observed.append({"kind": "desktop_ax", "window": {k: block[k] for k in ("app", "pid", "title") if k in block},
+                         "truncated": bool(block.get("truncated") or block.get("complete") is False),
+                         "nodes": [{k: node[k] for k in fields if k in node} for raw in block.get("nodes", [])
+                                   if (node := visible_native_node(raw)) is not None]})
+    return observed
 
 
 @dataclass(frozen=True)
@@ -158,7 +166,7 @@ class ProgressController:
                     self._clear_stall(state)
                 state.shell_outputs.append(output)
                 failure = "unchanged_shell_output"
-            elif execution.kind in {"env", "browser_dom"} and decision.action and decision.action.action not in {
+            elif execution.kind in {"env", "browser_dom", "desktop_ax"} and decision.action and decision.action.action not in {
                     "wait", "press", "hotkey", "handle_dialog", "switch_tab"}:
                 failure = "no_progress"
             else:

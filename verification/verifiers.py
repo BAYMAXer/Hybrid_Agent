@@ -20,6 +20,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from ..planning.task_specs import infer_paper_spec
 from ..papers.paper_resolver import arxiv_id_from_url, is_verified_binding, query_matches_title
+from .desktop_files import check_desktop_file, normalize_desktop_file, sample_desktop_file
 
 
 def _url(value):
@@ -62,6 +63,7 @@ def _normalize_spec(spec):
         "unresolved_requirement": {"text"},
         "download": {"url", "filename", "sha256", "min_bytes", "bind_to"},
         "paper_download": {"title", "query", "filename", "count", "format", "author", "year", "doi", "arxiv_id", "url", "min_bytes", "sha256", "bind_to", "workspace"},
+        "desktop_file": {"path", "change", "format", "sha256", "text_equals", "text_contains", "cells"},
     }
     checks, ids = [], set()
     for index, raw in enumerate(spec["checks"]):
@@ -100,6 +102,8 @@ def _normalize_spec(spec):
                 raise ValueError("element_state requires value or states")
         elif kind in ("text_present", "unresolved_requirement"):
             _string(check.get("text"), "text")
+        elif kind == 'desktop_file':
+            normalize_desktop_file(check)
         elif kind in ("download", "paper_download"):
             if "bind_to" in check:
                 _string(check["bind_to"], "bind_to")
@@ -147,7 +151,9 @@ def _normalize_spec(spec):
     return {"checks": checks}
 
 
-def _infer_spec(task):
+def _infer_spec(task, task_mode=None):
+    if task_mode in {'desktop', 'cli'}:
+        return {'checks': []}
     paper = infer_paper_spec(task)
     if paper:
         return _normalize_spec(paper)
@@ -330,10 +336,11 @@ class CompletionVerifier:
     a model's title claim, PDF metadata alone, or a filename.
     """
 
-    def __init__(self, task, spec=None, private_spec=None):
+    def __init__(self, task, spec=None, private_spec=None, *, task_mode=None):
         if not isinstance(task, str):
             raise ValueError("task must be a string")
-        self._public_spec = _normalize_spec(spec) if spec is not None else _infer_spec(task)
+        self.task_mode = task_mode
+        self._public_spec = _normalize_spec(spec) if spec is not None else _infer_spec(task, task_mode)
         if any("bind_to" in c for c in self._public_spec["checks"]):
             raise ValueError("bind_to is available only for private artifact checks")
         self._spec = copy.deepcopy(self._public_spec)
@@ -369,6 +376,17 @@ class CompletionVerifier:
         self._inferred = spec is None
         self._legacy_download_sequence = 0
         self._workspace_dir = None
+        self._desktop_file_env = None
+        self._desktop_file_baselines = {}
+
+    def bind_desktop_files(self, env):
+        """Bind verified target and snapshot change conditions before actions."""
+        if self._desktop_file_env is not None:
+            return
+        self._desktop_file_env = env
+        for check in self._spec['checks']:
+            if check['kind'] == 'desktop_file' and check['change'] != 'present':
+                self._desktop_file_baselines[check['id']] = sample_desktop_file(env, {'path': check['path']})
 
     @property
     def bindings(self):
@@ -688,7 +706,7 @@ class CompletionVerifier:
                 pass
         # Capture milestones now, even when evaluate() follows a later observation.
         for check in self._spec["checks"]:
-            if check["scope"] == "milestone" and check["kind"] not in ("download", "paper_download") and check["id"] not in self._milestones:
+            if check["scope"] == "milestone" and check["kind"] not in ("download", "paper_download", "desktop_file") and check["id"] not in self._milestones:
                 result = self._page_check(check)
                 if result["status"] == "passed":
                     self._milestones[check["id"]] = result
@@ -894,6 +912,10 @@ class CompletionVerifier:
         for check in checks:
             if check["kind"] in ("download", "paper_download"):
                 result = downloads[check["id"]]
+            elif check['kind'] == 'desktop_file':
+                status, reason, current = check_desktop_file(
+                    self._desktop_file_env, check, self._desktop_file_baselines.get(check['id']))
+                result = self._result(check, status, reason, 'target_file', file=current)
             elif check["id"] in self._milestones:
                 result = {**self._milestones[check["id"]], "source": "milestone"}
             else:

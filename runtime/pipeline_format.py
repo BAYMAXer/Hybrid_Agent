@@ -54,6 +54,8 @@ def _operation_mode(action, route) -> str:
     channel = (route or {}).get('channel')
     if channel == 'cli' or action.action == 'cli':
         return 'cli'
+    if channel == 'desktop_ax':
+        return 'desktop_ax'
     if channel == 'reobserve':
         return 'blocked'
     if action.action in {'request_finish', 'fail'}:

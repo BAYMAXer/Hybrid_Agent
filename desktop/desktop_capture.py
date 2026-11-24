@@ -5,12 +5,85 @@ and Win32 metrics run under the same per-monitor DPI context.
 """
 from contextlib import contextmanager
 import copy
+import hashlib
 import math
+import os
 import sys
 import time
 import uuid
 
 from ..actions import Action
+
+
+def _user32_desktop():
+    import ctypes
+    from ctypes import wintypes
+    user = ctypes.WinDLL("user32", use_last_error=True)
+    user.GetThreadDesktop.argtypes, user.GetThreadDesktop.restype = [wintypes.DWORD], wintypes.HANDLE
+    user.GetUserObjectInformationW.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                               wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    return user
+
+
+def _desktop_name(user, handle):
+    import ctypes
+    from ctypes import wintypes
+    name, length = ctypes.create_unicode_buffer(256), wintypes.DWORD()
+    if not user.GetUserObjectInformationW(handle, 2, name, ctypes.sizeof(name), ctypes.byref(length)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return name.value
+
+
+def windows_desktop_key():
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    session = wintypes.DWORD()
+    if not kernel.ProcessIdToSessionId(os.getpid(), ctypes.byref(session)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    user = _user32_desktop()
+    name = _desktop_name(user, user.GetThreadDesktop(kernel.GetCurrentThreadId()))
+    return hashlib.sha256(f"{session.value}/{name}".encode()).hexdigest()[:12]
+
+
+def input_desktop_active():
+    if sys.platform != "win32":
+        return True
+    import ctypes
+    from ctypes import wintypes
+    user = _user32_desktop()
+    user.OpenInputDesktop.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    user.OpenInputDesktop.restype = wintypes.HANDLE
+    user.CloseDesktop.argtypes = [wintypes.HANDLE]
+    active = user.OpenInputDesktop(0, False, 1)
+    if not active:
+        return False
+    try:
+        current = user.GetThreadDesktop(ctypes.windll.kernel32.GetCurrentThreadId())
+        return _desktop_name(user, current) == _desktop_name(user, active)
+    except OSError:
+        return False
+    finally:
+        user.CloseDesktop(active)
+
+
+def acquire_desktop_lease():
+    """The lifetime of the named kernel object grants this process exclusive input."""
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel.CreateMutexW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    ctypes.set_last_error(0)
+    handle = kernel.CreateMutexW(None, False, "Local\\HybridAgentDesktop-" + windows_desktop_key())
+    last_error = ctypes.get_last_error()
+    if not handle:
+        raise ctypes.WinError(last_error)
+    if last_error == 183:  # ERROR_ALREADY_EXISTS
+        kernel.CloseHandle(handle)
+        raise RuntimeError("此 Windows 桌面已有活动任务使用鼠标、键盘和 AX，请等待该任务结束")
+    return lambda: kernel.CloseHandle(handle)
 
 
 @contextmanager

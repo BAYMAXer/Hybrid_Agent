@@ -120,6 +120,7 @@ class StepState:
     paper_resolution: Dict[str, Any] = field(default_factory=dict)
     judge_rechecks: set = field(default_factory=set)
     judge_checkpoints: List[dict] = field(default_factory=list)
+    desktop_window_history: List[dict] = field(default_factory=list)
     unconfirmed_download_click: Dict[str, Any] = field(default_factory=dict)
     report_sources: List[dict] = field(default_factory=list)
     written_files: List[dict] = field(default_factory=list)

@@ -129,8 +129,10 @@ def infer_paper_spec(task: str):
     return {'checks': checks}
 
 
-def task_profile(task: str, public_spec=None):
+def task_profile(task: str, public_spec=None, *, task_mode=None):
     """Return only public goals and procedural hints, never evaluation answers."""
+    if task_mode in {'desktop', 'cli'}:
+        return {'kind': task_mode, 'goals': [], 'workflow': []}
     checks = public_spec.get("checks", []) if isinstance(public_spec, dict) else []
     papers = [copy.deepcopy(c) for c in checks if isinstance(c, dict) and c.get("kind") == "paper_download"]
     if not papers and public_spec is None:
@@ -155,12 +157,12 @@ def task_profile(task: str, public_spec=None):
     }
 
 
-def task_analysis(task, public_spec):
+def task_analysis(task, public_spec, *, task_mode=None):
     """Public diagnostics; an intent hint is not evidence that a task is done."""
     checks = public_spec.get('checks', [])
     unresolved = [c['text'] for c in checks if c.get('kind') == 'unresolved_requirement']
     hard = [c for c in checks if c.get('kind') != 'unresolved_requirement']
-    return {'version': TASK_ANALYSIS_VERSION, 'kind': task_profile(task, public_spec)['kind'],
+    return {'version': TASK_ANALYSIS_VERSION, 'kind': task_profile(task, public_spec, task_mode=task_mode)['kind'],
             'contract_status': 'partial' if hard and unresolved else 'deterministic' if hard else 'semantic',
             'check_count': len(hard), 'unresolved_requirements': unresolved or ([task] if not checks else []),
             'original_task': task}

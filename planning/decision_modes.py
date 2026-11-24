@@ -27,6 +27,7 @@ class DecisionMode:
 
 RECOVERY_ACTIONS = frozenset({"observe_desktop", "observe_browser", "wait", "request_finish", "fail"})
 MODE_ACTIONS = {
+    "desktop_ax": frozenset({"click", "type", "select", "press", "hotkey", "scroll", "switch_applications"}),
     "cli": frozenset({"cli", "observe_browser", "observe_desktop"}),
     "dom": frozenset({"click", "type", "press", "hotkey", "scroll", "goto", "select",
                       "list_tabs", "get_page_source", "run_browser_js", "double_click", "right_click"}),
@@ -35,6 +36,37 @@ MODE_ACTIONS = {
     "observe": frozenset(),
     "dialog": frozenset({"handle_dialog", "list_tabs", "observe_desktop", "observe_browser", "fail"}),
 }
+
+
+DESKTOP_ACTIONS = frozenset({"click", "double_click", "right_click", "type", "press", "hotkey",
+                             "scroll", "select", "drag_and_drop", "switch_applications",
+                             "observe_desktop", "request_finish", "wait", "fail", "cli"})
+
+
+def desktop_ax_blocks(obs):
+    """The Windows adapter only publishes trees matched to the captured foreground."""
+    return [b for b in (getattr(obs, "context", None) or []) if b.get("kind") == "desktop_ax"
+            and not b.get("stale") and b.get("window_ref") and b.get("snapshot_id")]
+
+
+def desktop_cli_step(task, step):
+    """Background operations are opt-in per planned milestone in desktop episodes."""
+    if 'cli' not in ((step or {}).get('actions') or []) and (step or {}).get('mode') != 'cli':
+        return False
+    task = task or ''
+    terminal = r"(?:命令行|终端|后台|PowerShell|\bCLI\b|\bshell\b)"
+    if re.search(r"(?:禁止|不要|不得|不允许|不使用|without|do not|don't)[^，。；;.]{0,16}" + terminal, task, re.I):
+        return False
+    method = (r"(?:打开|启动|使用|通过|用|在|\buse\b|\busing\b|\bwith\b|\bin\b|\bopen\b|\blaunch\b)\s*"
+              r"(?:微软\s*|Microsoft\s*)?(?:Excel|Word\b|PowerPoint|Notepad|Paint|Explorer|Calculator|"
+              r"计算器|记事本|画图|资源管理器|桌面界面|图形界面|鼠标|键盘)"
+              r"|(?:在|使用|通过)[^，。；;\n]{1,32}(?:应用中|软件中|客户端中|窗口中|的界面)"
+              r"|(?:操作|使用|用|\busing\s+|\buse\s+)\s*(?!(?:CLI|PowerShell|shell|terminal)\b)(?-i:[A-Z])[a-zA-Z0-9.-]+")
+    if not re.search(method, task, re.I):
+        return True
+    goal = (step or {}).get('goal', '')
+    return bool(re.search(terminal, task, re.I) and re.search(terminal, goal, re.I)
+                and not re.search(method, goal, re.I))
 
 
 def mode_evidence_key(task, obs, step=None):
@@ -64,7 +96,10 @@ def mode_capability(obs, step=None):
     """Only hard surface/capability constraints; no page-density heuristics."""
     info = (getattr(obs, "info", None) or {})
     cli = info.get('cli_capability') or {}
-    if cli.get('available') and ('cli' in ((step or {}).get('actions') or []) or (step or {}).get('mode') == 'cli' or info.get('active_surface') == 'terminal'):
+    actions = set((step or {}).get('actions') or [])
+    alternatives = (info.get('task_mode') == 'desktop' and cli.get('available') and 'cli' in actions
+                    and bool(actions & (DESKTOP_ACTIONS - RECOVERY_ACTIONS - {'cli'})))
+    if cli.get('available') and not alternatives and ('cli' in actions or (step or {}).get('mode') == 'cli' or info.get('active_surface') == 'terminal'):
         return DecisionMode('cli', 'terminal', 'planned_background_operation', 'capability')
     scene = observation_scene(obs)
     desktop = info.get("active_surface") == "desktop" or info.get("screenshot_space") == "screen_pixels"
@@ -80,6 +115,14 @@ def mode_capability(obs, step=None):
         # A fresh desktop capture can carry a separate CDP observation error;
         # that error must not prevent handling a native save/permission window.
         return DecisionMode("observe", surface, "observation_unavailable", "capability")
+    if info.get("task_mode") == "desktop":
+        if info.get("desktop_file_dialog"):
+            # Windows Shell tracks an additional committed filename besides the UIA edit value.
+            return DecisionMode("gui", "desktop", "native_file_dialog_keyboard_input", "capability")
+        if re.search(r"拖拽|拖动|拖放|拖到|\bdrag\b", (step or {}).get('goal', ''), re.I):
+            return DecisionMode("gui", "desktop", "visual_gesture_required", "capability")
+        if alternatives or any(n.get('direct') for b in desktop_ax_blocks(obs) for n in b.get('nodes', [])):
+            return None
     if desktop:
         return DecisionMode("gui", surface, "desktop_surface", "capability")
     if browser:
@@ -112,6 +155,13 @@ def decision_mode(obs, step=None, *, judgment=None, fallback_reason="jev_not_ava
     actionable = any(n.get('direct') and not (n.get('states') or {}).get('disabled')
                      for b in blocks for n in b.get('nodes', []))
     label = (judgment or {}).get('label')
+    if info.get('task_mode') == 'desktop':
+        if label == 'cli' and info.get('cli_capability', {}).get('available'):
+            return DecisionMode('cli', 'terminal', 'jev_background_operation', 'jev')
+        if label == 'desktop_ax' and any(n.get('direct') for b in desktop_ax_blocks(obs) for n in b.get('nodes', [])):
+            return DecisionMode('desktop_ax', 'desktop', 'jev_target_has_native_ax', 'jev')
+        return DecisionMode('gui', 'desktop', 'jev_visual_target' if label == 'gui' else 'visual_fallback',
+                            'jev' if label == 'gui' else 'fallback', '' if label == 'gui' else fallback_reason)
     if label == 'cli' and info.get('cli_capability', {}).get('available'):
         return DecisionMode('cli', 'terminal', 'jev_background_operation', 'jev')
     if label == 'gui':

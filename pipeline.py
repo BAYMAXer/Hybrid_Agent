@@ -49,7 +49,7 @@ from .planning.task_specs import task_profile, task_analysis, audit_requirement_
 from .runtime.step_progress import ProgressConfig, StepProgressMonitor
 from .model.decision_judge import DecisionJudge, DecisionJudgeConfig
 from .model.judge_selection import RuntimeDecisionJudge
-from .verification.judge_evidence import effect_review, evidence_fingerprint, checkpoint, target_identity, select_frame
+from .verification.judge_evidence import effect_review, evidence_fingerprint, checkpoint, target_identity, select_frame, desktop_window_transition
 from .papers.paper_workflow import PaperWorkflow, WORKFLOW_VERSION, binding_group_hash
 from .papers.paper_identity import PaperIdentitySelector
 from .papers.paper_sources import SOURCE_POLICY_VERSION, paper_search_policy
@@ -144,20 +144,27 @@ class Pipeline:
         self._verification = None         # 最近一次 finish 验证的调用记录
         self.wait_config = wait_config if isinstance(wait_config, WaitConfig) else WaitConfig(**(wait_config or {}))
         self.progress_config = progress_config if isinstance(progress_config, ProgressConfig) else ProgressConfig(**(progress_config or {}))
-        judge_options = dict(decision_judge or {}) if not isinstance(decision_judge, DecisionJudgeConfig) else {}
-        selection_policy = judge_options.pop('selection_policy', 'threshold')
-        if not isinstance(selection_policy, str) or selection_policy not in {'threshold', 'maximum_probability'}:
-            raise ValueError('selection_policy must be threshold or maximum_probability')
-        judge_config = decision_judge if isinstance(decision_judge, DecisionJudgeConfig) else DecisionJudgeConfig(**judge_options)
-        self.decision_judge = RuntimeDecisionJudge(judge_config, selection_policy=selection_policy) if judge_config.url else None
+        if callable(decision_judge):
+            self.decision_judge = decision_judge()  # A fresh client per episode.
+        else:
+            judge_options = dict(decision_judge or {}) if not isinstance(decision_judge, DecisionJudgeConfig) else {}
+            selection_policy = judge_options.pop('selection_policy', 'threshold')
+            if not isinstance(selection_policy, str) or selection_policy not in {'threshold', 'maximum_probability'}:
+                raise ValueError('selection_policy must be threshold or maximum_probability')
+            judge_config = decision_judge if isinstance(decision_judge, DecisionJudgeConfig) else DecisionJudgeConfig(**judge_options)
+            self.decision_judge = RuntimeDecisionJudge(judge_config, selection_policy=selection_policy) if judge_config.url else None
         self._task_deadline = None
-        self.verifier_model = verifier_model if verifier_model is not None else make_review_model(model)
+        self._new_review_model = getattr(getattr(model, 'inner', model), 'independent_reviewer', None) or (lambda: make_review_model(model))
+        self.verifier_model = verifier_model if verifier_model is not None else self._new_review_model()
         self.reviewer = StepReviewer(self.verifier_model, self.compiler)
         self._active_actions = None
         self._model_final_report = None
         self._reviewed_download_facts = []
         self._paper_search_recovery = PaperSearchRecovery()
-        self.paper_identity_selector = PaperIdentitySelector(make_review_model(model))
+        self.paper_identity_selector = PaperIdentitySelector(self._new_review_model())
+
+    def _wants_report(self, task):
+        return wants_report(task, desktop=getattr(getattr(self, 'env', None), 'task_mode', None) == 'desktop')
 
     # ================= 主循环 ================= #
     def run(self, task: str) -> AgentResult:
@@ -168,11 +175,12 @@ class Pipeline:
         self._current_step = 0
         self._knowledge_selection = None
         self._report_delivery = {}
-        self._report_required = wants_report(task)
+        self._report_required = self._wants_report(task)
         self.reviewer.calls.clear()
         self._model_final_report = None
         self._reviewed_download_facts = []
-        self.completion = CompletionVerifier(task, self.completion_spec, self.private_completion_spec)
+        self.completion = CompletionVerifier(task, self.completion_spec, self.private_completion_spec,
+            task_mode=getattr(self.env, 'task_mode', None) or ('cli' if getattr(self.env, 'cli_only', False) else None))
         self.paper_identity_selector.calls.clear()
         self._paper_workflow = PaperWorkflow(identity_selector=self._select_paper_identity, task=task)
         self._paper_search_recovery = PaperSearchRecovery(task=task)
@@ -312,6 +320,9 @@ class Pipeline:
             "desktop/desktop_state.py",
             "desktop/desktop_readiness.py",
             "desktop/desktop_capture.py",
+            "desktop/hcu_ax.py",
+            "model/terra_verification.py",
+            "verification/desktop_files.py",
             "desktop/windows_text.py",
             "adapters/windows_env.py",
             "adapters/vmware_env.py",
@@ -337,7 +348,7 @@ class Pipeline:
                     "grounder_trainable": False, "verifier_trainable": False,
                     "verifier_model": model_record(self.verifier_model), "max_steps": self.max_steps,
                     "public_completion": self.completion.public_spec,
-                    "task_analysis": task_analysis(task, self.completion.public_spec),
+                    "task_analysis": task_analysis(task, self.completion.public_spec, task_mode=self.completion.task_mode),
                     "paper_search_policy": paper_search_policy(task) if self.completion.paper_goals() else None,
                     "completion_hash": hashlib.sha256(json.dumps(self.completion.spec, sort_keys=True).encode()).hexdigest(),
                     **self.run_manifest}
@@ -387,7 +398,8 @@ class Pipeline:
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix='agent-prepare') as pool:
             client = pool.submit(measured_call, prepare_model_client, self.planner_model)
             classification = (pool.submit(measured_call, self.decision_judge.classify_task,
-                task, remaining_s=self._task_time_remaining()) if self.decision_judge else None)
+                task, remaining_s=self._task_time_remaining()) if self.decision_judge and
+                self.completion.task_mode not in {'desktop', 'cli'} else None)
             environment_started = time.perf_counter()
             self._prepare_initial_environment(task, state, result)
             environment_ms = (time.perf_counter() - environment_started) * 1000
@@ -415,8 +427,9 @@ class Pipeline:
         if not hasattr(self.env, 'initial_state'):
             self.env.initial_state = {}
         self.env.initial_state['cli_capability'] = cli_capability(self.env)
-        state.task_profile = task_profile(task, self.completion.public_spec)
-        self._publish_diagnostic('task_analysis', analysis=task_analysis(task, self.completion.public_spec))
+        mode = self.completion.task_mode
+        state.task_profile = task_profile(task, self.completion.public_spec, task_mode=mode)
+        self._publish_diagnostic('task_analysis', analysis=task_analysis(task, self.completion.public_spec, task_mode=mode))
         unresolved = [c["text"] for c in self.completion.public_spec.get("checks", [])
                       if c.get("kind") == "unresolved_requirement"]
         if unresolved:
@@ -425,7 +438,16 @@ class Pipeline:
         # A preloaded browser page is part of the environment, not the task.
         # Observe it before planning so the planner can use an existing search
         # form instead of inventing a new portal from the title alone.
-        if getattr(self.env, 'browser_start_url', None):
+        if mode == 'desktop':
+            set_file_intent = getattr(self.env, 'set_desktop_file_intent', None)
+            if callable(set_file_intent):
+                set_file_intent(task, self.completion.public_spec.get('checks', []))
+            state.obs = self.env.reset(task)
+            self.completion.bind_desktop_files(self.env)
+            self.completion.observe(state.obs)
+        elif mode == 'cli':
+            self.completion.bind_desktop_files(self.env)
+        elif getattr(self.env, 'browser_start_url', None):
             state.obs = self._initial_browser_observation(task)
             self._set_download_deadline()
             self.completion.observe(state.obs)
@@ -516,7 +538,7 @@ class Pipeline:
                 })
                 self._emit("transition", transition=result.trajectory[-1])
                 state.memory.add_event("⚠️ 上一步动作解析失败，请重新输出合法的 next_action JSON")
-                if state.verification.get("status") == "passed" and not wants_report(state.task):
+                if state.verification.get("status") == "passed" and not self._wants_report(state.task):
                     result.success = True
                     result.termination_reason = "verified"
                     break
@@ -528,6 +550,8 @@ class Pipeline:
                         break
                 continue
             ground_started = time.perf_counter()
+            self._logical_grounding_calls = 0
+            self._ocr_used = False
             action = (self.ground(decision.action, state) if self._task_time_remaining() > 0
                       else copy.deepcopy(decision.action))
             self._emit("route", action=self._compact_action(decision.action),
@@ -552,6 +576,25 @@ class Pipeline:
             execution = (self.execute(action, state) if self._task_time_remaining() > 0 else
                          Execution(kind="deadline", info={"status": "rejected", "dispatched": False,
                                    "error_code": "task_timeout", "reason": "任务总时限已到，未执行新动作"}))
+            execution.info['grounding_calls'] = self._logical_grounding_calls
+            execution.info['grounding_ocr_used'] = self._ocr_used
+            if not self._logical_grounding_calls:
+                execution.info['grounding_skip_reason'] = (state.route or {}).get('channel') or 'no_coordinate_action'
+            if (execution.info.get('continuation') or {}).get('state') == 'stop':
+                # HCU can report partially delivered input. Even a read/settle may violate its stop contract.
+                result.success = False
+                result.termination_reason = 'desktop_input_uncertain'
+                result.final_answer = execution.info.get('reason') or '桌面执行器报告输入可能已生效，已停止。'
+                result.verification = {'status': 'unknown', 'reason': result.final_answer, 'checks': []}
+                entry = {**action_context, 'step': step_no, 'action_id': f'a_{step_no}', 'observation': before,
+                         'action': self._compact_action(action), 'execution_info': execution.info,
+                         'operation_mode': self._operation_mode(action, state.route), 'policy_output': decision.raw,
+                         'decision_calls': decision.calls, 'verification': result.verification, 'done': True,
+                         'terminated': False, 'truncated': True}
+                result.trajectory.append(entry)
+                self._emit('execution', action=entry['action'], execution_info=execution.info)
+                self._emit('transition', transition=entry)
+                return result
             execution = self._settle_action(action, execution, state)
             self._emit("execution", action=self._compact_action(state.resolved_action or action),
                        execution_info=execution.info, outcome=execution.outcome,
@@ -608,7 +651,7 @@ class Pipeline:
             if should_break:
                 break
 
-        result.score = self._evaluate(result)
+        result.score = self._evaluate(result, state)
         if result.termination_reason == "unknown":
             result.termination_reason = "max_steps"
         # 补齐最后一步的 assessment（任务结束时没有下一步决策来评估 a_N）
@@ -650,7 +693,8 @@ class Pipeline:
             self._set_download_deadline()
         from .runtime.cli_executor import cli_capability
         state.obs.info['cli_capability'] = cli_capability(self.env)
-        if getattr(mode_capability(state.obs, state.queue.current if state.queue else None), 'mode', None) != 'cli':
+        if (state.obs.info.get('task_mode') != 'desktop' and
+                getattr(mode_capability(state.obs, state.queue.current if state.queue else None), 'mode', None) != 'cli'):
             state.obs = self._settle_rendering(Execution(kind="env", obs=state.obs), state).obs
         from .reporting.report_delivery import collect_sources
         collect_sources(state)
@@ -700,6 +744,10 @@ class Pipeline:
         from .runtime.cli_executor import cli_capability
         if state.obs is not None:
             state.obs.info['cli_capability'] = cli_capability(self.env)
+            if state.obs.info.get('task_mode') == 'desktop':
+                from .planning.decision_modes import desktop_cli_step
+                if not desktop_cli_step(state.task, current):
+                    state.obs.info['cli_capability'].update(available=False, reason='当前子任务使用桌面应用')
         hard = mode_capability(state.obs, current)
         if hard is not None:
             profile = hard
@@ -713,7 +761,7 @@ class Pipeline:
                 if cached.get('evidence_key') == key:
                     selection = cached
                 else:
-                    remaining = min(5.0, self._task_time_remaining())
+                    remaining = min(getattr(judge, 'mode_timeout_s', 5.0), self._task_time_remaining())
                     if remaining <= 0:
                         judged = {'status': 'unknown', 'reason': 'task_deadline'}
                     else:
@@ -751,6 +799,13 @@ class Pipeline:
         # 结构观察块：browser AX snapshot（context）+ 桌面 AX（text）
         blocks = list(state.obs.context) if state.obs else []
         observation_info = state.obs.info if state.obs else {}
+        if observation_info.get('task_mode') == 'desktop':
+            from .desktop.desktop_readiness import foreground
+            window = foreground(observation_info.get('runtime_state') or {}) or {}
+            current_window = {k:window[k] for k in ('process_name', 'title', 'class_name') if k in window}
+            current_window['ax_status'] = observation_info.get('desktop_ax_status', 'unavailable')
+            blocks.insert(0, {'kind':'desktop_window', 'text':'当前前台窗口 ' +
+                              json.dumps(current_window, ensure_ascii=False)})
         browser_events = {k: observation_info[k] for k in (
             "dialog", "dialogs", "tabs", "active_modals", "browser_events", "artifacts",
             "pending_downloads", "download_events", "download_candidates", "document_kind", "content_type", "screenshot_stale")
@@ -867,16 +922,21 @@ class Pipeline:
             if action is not None:
                 err = self._validate_action(action)
                 error_type = 'invalid_action'
-                if err is None and state is not None:
+                if err is None and state is not None and state.obs is not None and action.args.get('target_ref'):
+                    info = state.obs.info
+                    if info.get('task_mode') == 'desktop' and (info.get('decision_mode') or {}).get('mode') == 'gui':
+                        err = '本轮为纯视觉 GUI 模式。只给截图中可见目标的描述，不填 target_ref。'
+                browser_rules = state is not None and getattr(self.env, 'task_mode', None) != 'desktop'
+                if err is None and browser_rules:
                     err = search_navigation_error(action, state.task,
                         state.queue.current if state.queue else None, state.obs, self.completion) or None
                     if err:
                         error_type = 'unobserved_search_result'
-                if err is None and state is not None:
+                if err is None and browser_rules:
                     err = self._paper_search_action_error(action, state) or None
                     if err:
                         error_type = 'redundant_search_action'
-                if err is None and state is not None:
+                if err is None and browser_rules:
                     err = redundant_sort_selection_error(action, state.obs) or None
                     if err:
                         error_type = 'redundant_control_action'
@@ -956,6 +1016,8 @@ class Pipeline:
             return None
         from .runtime.scene import observation_scene
         selected_mode = ((state.obs.info or {}).get('decision_mode') or {}).get('mode') if state.obs else None
+        if state.obs and state.obs.info.get('task_mode') == 'desktop':
+            return None
         if ((selected_mode == 'gui' or (selected_mode is None and observation_scene(state.obs).get('mode') == 'browser_gui'))
                 and action.action in {'click', 'double_click', 'right_click', 'type'}):
             return None
@@ -1004,17 +1066,25 @@ class Pipeline:
                              and action.action in {'click', 'double_click', 'right_click', 'type', 'drag_and_drop'}
                              and not action.args.get('target_ref') and not action.args.get('element_id'))
             state.route = None if visual_target else self.env.route_action(action, state.obs)
-        except Exception:  # noqa: BLE001
-            state.route = None
-        search_error = search_navigation_error(action, state.task,
-            state.queue.current if state.queue else None, state.obs, self.completion)
-        input_error = self._paper_search_action_error(action, state)
-        error = (input_error or search_error or redundant_sort_selection_error(action, state.obs, state.route)
-                 or paper_download_preflight_error(action, state.obs, self.completion, state.route)
-                 or paper_action_error(action, state.obs,
-                                      active_paper(self.completion, state.queue.current if state.queue else None), state.route))
-        if error:
-            state.route = {"channel": "reobserve", "error_code": "redundant_search_action" if input_error else "unobserved_search_result" if search_error else "paper_identity_mismatch", "reason": error}
+        except Exception as exc:
+            state.route = ({'channel': 'reobserve', 'source': 'desktop_ax', 'error_code': 'ax_route_error',
+                            'reason': type(exc).__name__} if state.obs.info.get('task_mode') == 'desktop'
+                           and action.args.get('target_ref') else None)
+        if (state.obs.info.get('task_mode') == 'desktop' and action.args.get('target_ref')
+                and (profile.get('mode') == 'gui' or state.route is None
+                     or action.args['target_ref'] not in state.obs.info.get('exposed_refs', []))):
+            state.route = {'channel': 'reobserve', 'source': 'desktop_ax', 'error_code': 'stale_element_ref',
+                           'reason': '当前模式或观察未开放这个桌面控件引用，请重新观察。'}
+        if state.obs.info.get('task_mode') != 'desktop':
+            search_error = search_navigation_error(action, state.task,
+                state.queue.current if state.queue else None, state.obs, self.completion)
+            input_error = self._paper_search_action_error(action, state)
+            error = (input_error or search_error or redundant_sort_selection_error(action, state.obs, state.route)
+                     or paper_download_preflight_error(action, state.obs, self.completion, state.route)
+                     or paper_action_error(action, state.obs,
+                                          active_paper(self.completion, state.queue.current if state.queue else None), state.route))
+            if error:
+                state.route = {"channel": "reobserve", "error_code": "redundant_search_action" if input_error else "unobserved_search_result" if search_error else "paper_identity_mismatch", "reason": error}
         if action.args.get('submit_key') and (state.route or {}).get('channel') not in {'browser_dom', 'reobserve'}:
             state.route = {'channel': 'reobserve', 'error_code': 'unsupported',
                            'reason': '输入后提交仅支持当前 DOM 输入框；请重新观察或分开 type 和 press'}
@@ -1037,7 +1107,8 @@ class Pipeline:
 
     @staticmethod
     def _attach_observation_space(action, obs):
-        if obs is not None and any(k in action.args for k in ("x", "x1")):
+        if obs is not None and (any(k in action.args for k in ("x", "x1")) or
+                (obs.info.get("task_mode") == "desktop" and action.action in {"press", "hotkey", "scroll"})):
             info = obs.info or {}
             action.args["coordinate_space"] = info.get("screenshot_space", "screen_pixels")
             action.args["observation_metadata"] = {
@@ -1113,6 +1184,12 @@ class Pipeline:
     @timed_phase("dispatch")
     def execute(self, action: Action, state: StepState) -> Execution:
         name = action.action
+        if getattr(self.env, 'task_mode', None) == 'desktop':
+            from .planning.decision_modes import DESKTOP_ACTIONS, desktop_cli_step
+            if (name not in DESKTOP_ACTIONS or (self._active_actions is not None and name not in self._active_actions)
+                    or (name == 'cli' and not desktop_cli_step(state.task, state.queue.current if state.queue else None))):
+                return Execution(kind='rejected', obs=state.obs, info={'status':'rejected', 'dispatched':False,
+                                 'error_code':'desktop_scope', 'reason':'当前桌面步骤未授权该动作'})
         # 技能路由：已注册的确定性 skill（calculate / verify_file / ilearning_* 等）
         from .skills import is_skill, run_skill
         if is_skill(name):
@@ -1163,7 +1240,7 @@ class Pipeline:
             return Execution(kind='rejected', executed='rejected', outcome=repeated['reason'],
                              obs=state.obs, info=repeated)
         guard = getattr(self.env, 'prevent_duplicate_download', None)
-        if callable(guard) and name in {'click', 'double_click', 'hotkey', 'press'}:
+        if getattr(self.env, 'task_mode', None) != 'desktop' and callable(guard) and name in {'click', 'double_click', 'hotkey', 'press'}:
             try:
                 duplicate = guard(action, state.obs, state.route)
             except Exception as exc:
@@ -1173,6 +1250,15 @@ class Pipeline:
                 self._publish_diagnostic('duplicate_download', **duplicate)
                 return Execution(kind='rejected', outcome=duplicate['reason'], obs=self._observe(), info=duplicate)
         # browser_dom 通道：路由成功后走 DOM 定位执行（跳过 grounding）
+        if state.route and state.route.get("channel") == "desktop_ax":
+            try:
+                step_result = self.env.execute_routed(action, state.route)
+            except Exception as exc:
+                return Execution(kind="desktop_ax", obs=state.obs, info={"status":"uncertain",
+                    "continuation":{"state":"stop"}, "reason":f"无法确认原生输入结果：{type(exc).__name__}"})
+            return Execution(kind="desktop_ax", executed=self._compact_action(action), info=step_result.info,
+                             outcome=json.dumps(step_result.info, ensure_ascii=False),
+                             obs=step_result.observation, reward=step_result.reward, done=step_result.done)
         if state.route and state.route.get("channel") == "browser_dom":
             try:
                 step_result = self.env.execute_routed(action, state.route)
@@ -1188,7 +1274,7 @@ class Pipeline:
                                  obs=self._observe(),
                                  info={"status": "uncertain", "error_type": type(exc).__name__})
         if state.route and state.route.get("channel") == "reobserve":
-            return Execution(kind="browser_dom", outcome=state.route.get("reason", "需重新观察"),
+            return Execution(kind=state.route.get('source', 'browser_dom'), outcome=state.route.get("reason", "需重新观察"),
                              executed="rejected", obs=self._observe(),
                              info={"status": "rejected", "dispatched": False,
                                    "reason": state.route.get("reason", "需重新观察"),
@@ -1397,8 +1483,8 @@ class Pipeline:
 
     @timed_phase("settlement")
     def _settle_action(self, action, execution, state):
-        if execution.kind == 'cli':
-            # Background operations cannot be waiting on PDF pixels/window focus.
+        if execution.kind == 'cli' or getattr(self.env, 'task_mode', None) == 'desktop':
+            # Native readiness and reobservation belong to the Windows executor.
             return execution
         action = state.resolved_action or action
         execution = self._follow_ambiguous_tabs(action, execution, state)
@@ -1503,9 +1589,9 @@ class Pipeline:
         before_screenshot = state.screenshot_history[-1] if state.screenshot_history else None
         if execution.obs is not None:
             state.obs = execution.obs
-        from .reporting.report_delivery import collect_sources, wants_report
+        from .reporting.report_delivery import collect_sources
         collect_sources(state)
-        if wants_report(state.task) and (execution.kind == 'finish_request' or
+        if self._wants_report(state.task) and (execution.kind == 'finish_request' or
                 (state.queue and (state.queue.current or {}).get('phase') == 'report')):
             self._ensure_report(state)
         self.completion.observe(state.obs, execution.info)
@@ -1541,7 +1627,7 @@ class Pipeline:
             self._clear_stall(state)
             state.memory.control_state = "ADVANCE"
         should_break = False
-        report_required = wants_report(state.task)
+        report_required = self._wants_report(state.task)
         report_milestone = bool(report_required and state.queue and state.queue.current and state.queue.current.get('phase') == 'report')
         if report_required and state.queue is not None and (state.queue.current is None or report_milestone):
             self._ensure_report(state)
@@ -1734,16 +1820,18 @@ class Pipeline:
             try:
                 snapshot = load_knowledge()
                 if self.knowledge_method == 'decision':
-                    selection_model = make_review_model(self.model)
+                    selection_model = self._new_review_model()
                     if selection_model:
                         selection_model.cfg.max_tokens = 4096
                         selection_model.cfg.timeout = max(.1, min(120, self._task_deadline-time.monotonic())) if self._task_deadline else 120
-                        configure_selection_transport(selection_model)
+                        if not getattr(selection_model, 'verification_backend', None):
+                            configure_selection_transport(selection_model)
                 elif self.knowledge_method == 'jev':
                     cfg = self.decision_judge.config if self.decision_judge else DecisionJudgeConfig()
                     from dataclasses import replace
                     from .model.decision_judge import DecisionJudge
-                    selection_judge = DecisionJudge(replace(cfg, url=self.knowledge_jev_url or cfg.url))
+                    factory = getattr(self.decision_judge, 'independent_judge', None)
+                    selection_judge = factory() if factory else DecisionJudge(replace(cfg, url=self.knowledge_jev_url or cfg.url))
                 self._knowledge_selection = select_knowledge(task, snapshot, method=self.knowledge_method,
                     model=selection_model, judge=selection_judge,
                     remaining_s=max(0, self._task_deadline-time.monotonic()) if self._task_deadline else None)
@@ -1778,7 +1866,7 @@ class Pipeline:
             self._emit('plan_revision', revision=self._replans, previous=previous_snapshot,
                        plan=copy.deepcopy(state.memory.plan), queue=state.queue.snapshot(),
                        reason=plan.get('strategy_change', '') or ('依据失败证据调整剩余计划' if repair else '初始计划'))
-            self._publish_diagnostic('task_analysis', analysis={**task_analysis(task, self.completion.public_spec),
+            self._publish_diagnostic('task_analysis', analysis={**task_analysis(task, self.completion.public_spec, task_mode=self.completion.task_mode),
                 'requirement_proposals': state.memory.plan['requirements']})
             self._publish_queue(state)
             if repair:
@@ -1904,7 +1992,7 @@ class Pipeline:
                 refreshed, _ = self._code_step_review(state, step, execution_info)
                 hard_block = refreshed['status'] == 'failed' or unresolved_desktop_checks(refreshed) or any(
                     p.get('kind') in {'download_complete', 'download_valid', 'artifact_download'} for p in step.get('verification', []))
-            if hard_block or (refreshed['status'] == 'passed' and not (step.get('id') in {'whole_task', 'final'} and wants_report(state.task))):
+            if hard_block or (refreshed['status'] == 'passed' and not (step.get('id') in {'whole_task', 'final'} and self._wants_report(state.task))):
                 result = {**refreshed, 'prior_judgment': typed.get('judgment')}
                 retry_status, reason = 'code_resolved', '补充观察后由代码核查裁定，不再调用 Jev'
             elif (fresh.info or {}).get('pending_downloads'):
@@ -1960,7 +2048,8 @@ class Pipeline:
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix='agent-action-review') as pool:
             future = pool.submit(measured_call, self.decision_judge.assess_transition,
                 state.task, step, before, state.obs, review_execution, effect,
-                remaining_s=min(12.0, self._task_time_remaining()))
+                remaining_s=min(getattr(self.decision_judge, 'transition_timeout_s', 12.0),
+                                self._task_time_remaining()))
             (report, public), code_ms = measured_call(self._code_step_review,
                 state, step, execution.info, allow_contract=execution.kind != 'terminal')
             transition, judge_ms = future.result()
@@ -2002,6 +2091,11 @@ class Pipeline:
                 review_execution['args']['target_ref'] = str(state.route['target_ref'])
         review_execution['target_node'] = target_identity(before_observation, review_execution.get('args') or {})
         review_execution['expected_effect'] = expected_effect
+        window_change = desktop_window_transition(before_observation, state.obs, review_execution.get('action'),
+            review_execution.get('args', {}), execution.info, state.step_id)
+        if window_change:
+            state.desktop_window_history.append(window_change)
+            state.desktop_window_history[:] = state.desktop_window_history[-16:]
         observation_only = execution.kind == 'framework_observation'
         effect = ({'status': 'not_applicable', 'source': 'framework', 'scope': 'observation',
                    'reason': '仅核查已经观察到的状态，本项没有新的动作派发'} if observation_only else
@@ -2210,37 +2304,19 @@ class Pipeline:
         code = {'method': 'code', 'status': report.get('status', 'unknown'),
                 'reason': public.get('reason', '明确条件已检查，剩余语义要求需独立核查'),
                 'checks': public.get('checks', [])}
+        if getattr(state, 'desktop_window_history', None):
+            code['desktop_window_history'] = state.desktop_window_history.copy()
+            code['desktop_window_history_scope'] = ('按步骤排列的 Win32 实测前后台窗口变化和执行器已派发的快捷键。'
+                'previous_window_listed_after=false 表示下一次完整枚举已找不到原可见窗口。进程是否退出需另有证据。'
+                '用这些收据核对要求的操作顺序，用当前截图和文件检查核对最终状态。')
         # Only terminal-step file requirements are final invariants; intermediate
         # files may intentionally be renamed/removed by later steps.
         steps = (getattr(state.memory, 'plan', None) or {}).get('steps', [])
-        predicates = []
+        from .verification.desktop_files import durable_file_predicates
         from .runtime.cli_executor import cli_capability
         cap = cli_capability(self.env)
-        relocations = getattr(self, '_cli_relocations', {})
-        for item in steps:
-            for original in item.get('verification', []):
-                if original.get('kind') not in {'file_exists', 'file_absent', 'file_content', 'files_equal'}:
-                    continue
-                predicate = copy.deepcopy(original)
-                # Only earlier milestones follow framework-observed moves.
-                # Explicit final path requirements are never rewritten.
-                if item.get('phase') not in {'verify', 'final'} and predicate['kind'] != 'file_absent' and cap['target'] == 'local':
-                    for key in ('path', 'other_path'):
-                        if key not in predicate:
-                            continue
-                        path = os.path.abspath(os.path.join(cap['workspace'], predicate[key]))
-                        seen = set()
-                        while path in relocations and path not in seen:
-                            seen.add(path)
-                            path = relocations[path]
-                        if seen:
-                            predicate[key] = path
-                # Later explicit conditions on a path supersede intermediate
-                # existence/content states, e.g. intentional deletion.
-                family = 'presence' if predicate['kind'] in {'file_exists', 'file_absent'} else predicate['kind']
-                predicates = [p for p in predicates if not (p.get('path') == predicate['path'] and
-                    ('presence' if p['kind'] in {'file_exists', 'file_absent'} else p['kind']) == family)]
-                predicates.append(predicate)
+        predicates = durable_file_predicates(steps, getattr(self, '_cli_relocations', {}),
+                                             cap['workspace'] if cap['target'] == 'local' else '')
         if predicates and state.obs is not None:
             from .runtime.cli_executor import file_check_samples
             state.obs.info['cli_checks'] = file_check_samples(self.env, predicates, self._task_time_remaining)
@@ -2300,8 +2376,7 @@ class Pipeline:
 
     @timed_phase("final_review")
     def _verify_finish(self, state: StepState, answer: str) -> Tuple[bool, str]:
-        from .reporting.report_delivery import wants_report
-        report_required = wants_report(state.task)
+        report_required = self._wants_report(state.task)
         if report_required and state.report_delivery.get('status') != 'complete':
             return False, '信息整理结果尚未生成完成，不能验收通过'
         report = self.completion.evaluate()
@@ -2448,6 +2523,16 @@ class Pipeline:
 
     def _validate_action(self, action: Action) -> Optional[str]:
         from .skills import is_skill, validate_skill
+        supported = getattr(self.env, 'supported_actions', None)
+        if supported is not None and action.action not in supported:
+            return f"当前环境不支持动作或技能 {action.action}"
+        if getattr(self.env, 'task_mode', None) == 'desktop':
+            from .planning.decision_modes import DESKTOP_ACTIONS
+            if action.action not in DESKTOP_ACTIONS or action.args.get('element_id') or action.args.get('submit_key'):
+                return '当前任务只开放本轮桌面动作和原生控件引用'
+            if (not isinstance(action.args.get('target', ''), str)
+                    or str(action.args.get('target', '')).startswith('desktop:')):
+                return '请把桌面节点 ref 填入 target_ref，target 填可见名称或控件描述。此动作尚未执行。'
         if is_skill(action.action):
             return validate_skill(action.action, action.args)
         if action.action not in BASIC_ACTIONS:
@@ -2457,6 +2542,7 @@ class Pipeline:
         return validate_action(action)
 
     def _locate_recorded(self, screenshot, target):
+        self._logical_grounding_calls = getattr(self, '_logical_grounding_calls', 0) + 1
         previous = getattr(self.grounding, 'last_calls', None)
         if isinstance(previous, list):
             previous.clear()
@@ -2488,9 +2574,10 @@ class Pipeline:
         if spec.resolve == "point":
             gr = self._locate_recorded(obs.screenshot, str(action.args.get("target", "")))
             coord = resolve_coords(gr)
-            if coord is None:
+            if coord is None and getattr(self.grounding, 'allow_ocr_fallback', True):
                 # UI-TARS 失败：尝试 OCR 文字定位兜底（对齐 AgentS3 的第二条 grounding 腿）
                 coord = self._ocr_fallback(obs.screenshot, str(action.args.get("target", "")))
+                self._ocr_used = coord is not None
             if coord is None:
                 # grounding 失败：不带可执行坐标，由执行器拒绝（空转），不做坐标钳制
                 return Action(action.action, {**extra, "grounding_failed": True})
@@ -2499,8 +2586,9 @@ class Pipeline:
         if spec.resolve == "select":
             gr = self._locate_recorded(obs.screenshot, str(action.args.get("target", "")))
             coord = resolve_coords(gr)
-            if coord is None:
+            if coord is None and getattr(self.grounding, 'allow_ocr_fallback', True):
                 coord = self._ocr_fallback(obs.screenshot, str(action.args.get("target", "")))
+                self._ocr_used = coord is not None
             if coord is None:
                 return Action(action.action, {**extra, "grounding_failed": True})
             x, y = coord
@@ -2601,7 +2689,7 @@ class Pipeline:
         return report, facts, fresh
 
     @timed_phase("final_revalidation")
-    def _evaluate(self, result: AgentResult) -> float:
+    def _evaluate(self, result: AgentResult, state=None) -> float:
         def refresh_final_pages(observation=None):
             checks = self.completion.spec.get("checks", [])
             if not any(check.get("scope") == "final" and check.get("kind") in {
@@ -2636,6 +2724,17 @@ class Pipeline:
                     report['reason'] = '文件结果已单独核实，整任务语义验收仍不确定；没有新的证据，停止重复结束请求'
             was_success = result.success
             model_report = self._model_final_report
+            if state is not None and getattr(self.env, 'task_mode', None) == 'desktop':
+                file_checks = self._final_code_evidence(state, report).get('file_checks', [])
+                if any(c.get('status') != 'passed' for c in file_checks):
+                    self._model_final_report = None
+                    result.success = False
+                    result.termination_reason = 'verification_changed' if was_success else result.termination_reason
+                    result.final_answer = '最终文件回读未满足交付要求。'
+                    result.verification = {**report, 'status':'failed' if any(c.get('status') == 'failed' for c in file_checks)
+                                           else 'unknown', 'reason': result.final_answer, 'file_checks':file_checks}
+                    self._emit('verification', stage='final_evaluation', report=result.verification)
+                    return 0.0
             if model_report and self._download_proof_invalidated(self._reviewed_download_facts, download_facts):
                 model_report = self._model_final_report = None
                 report['reason'] = '最终模型验收所依据的下载文件已丢失或改变，原成功结论失效'

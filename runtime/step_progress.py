@@ -21,7 +21,7 @@ class ProgressConfig:
 
 
 def _nodes(obs):
-    return [n for b in (getattr(obs, 'context', None) or []) if b.get('kind') == 'browser_ax'
+    return [n for b in (getattr(obs, 'context', None) or []) if b.get('kind') in {'browser_ax', 'desktop_ax'}
             for n in b.get('nodes', [])]
 
 

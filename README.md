@@ -490,6 +490,31 @@ token 只汇总规范 `model_call` 事件并按 `call_id` 去重，包括规划�
 策略说明是模型建议，不能证明新方法有效；改写措辞但实际无效的路径仍须由执行核查发现。
 知识检索与重规划依据均可在轨迹详情中查看。
 
+## Windows 通用桌面任务
+
+Windows 本地 runner 和 Studio 的单次、批量任务默认从原生桌面启动。下表列出任务入口。
+
+| 参数 | 执行环境 |
+|---|---|
+| `--task-mode desktop` | 默认模式。操作记事本、资源管理器等原生窗口，支持在多个原生应用间切换。 |
+| `--task-mode browser` | 显式启动已有 Chrome/CDP 流程。网页回放演示使用此模式。 |
+| `--task-mode cli` 或 `--cli-only` | 使用后台文件和终端工具，可在 Windows、macOS 和 Linux 运行。 |
+
+桌面任务与浏览器任务共用规划、执行队列、步骤核查与最终验收流程。每轮由决策模型选择一个动作。前台窗口提供可操作的 AX 控件时，模型可以复制本轮的 `target_ref`，框架重新校验窗口并通过 HCU 执行。纯视觉点击由定位模型在当前截图中返回一个点，拖拽分别定位两端。快捷键和 AX 动作跳过视觉定位。Jev 结合截图、控件回读、文件证据及执行回执判断进展。需要保存在磁盘上的文件由执行器重新读取。当前版本支持跨原生应用任务；网页与原生桌面混合编排留待后续版本。
+
+可选的 HCU Windows 运行时使用上游版本 `697d3fb`。在 PowerShell 7 中运行 `./hybrid_agent/scripts/install-hcu-windows.ps1 -SourceDirectory <HCU源码目录>`。安装脚本会检查源码版本并构建运行时。启动时若没有可用的 AX 组件，桌面任务会继续使用本地截图和鼠标键盘。
+
+HCU 源码映射、三模型在各类动作中的输入输出和验收条件见 [Windows 通用桌面任务 V1 修改计划](docs/desktop-hcu-windows.md)。
+
+无需提供三个独立的模型接口即可做联调。已安装 Codex CLI 且当前登录具备 `gpt-6.1-terra` 访问权限时，在仓库父目录执行以下命令。
+
+```powershell
+python -m hybrid_agent.model.terra_verification --smoke
+python -m hybrid_agent.run_local --task-mode desktop --verification-backend terra --task "用记事本在默认工程目录保存 hello.txt，正文为你好"
+```
+
+第一条命令用程序生成的色块图分别检查决策、像素定位和 Jev 类型化应答。第二条把三个角色接入真实任务，每次调用使用独立的临时 Codex app-server 会话，轨迹记录响应模型、会话和回合 ID。Jev 的选项和概率经过本地原有校验器，模型自报概率仅用于验证协议与分流。需要验证纯视觉执行时，追加 `--disable-desktop-ax --disable-ocr-grounding`。Studio 提供相同的任务场景、Terra 和纯视觉选项。
+
 ## 连接远程模型运行
 
 默认决策模型使用阿里云百炼的多模态 `qwen3.7-flash`。将密钥放在仓库根目录的忽略文件
@@ -502,7 +527,7 @@ Flash 型号。
 的 Chrome。模型均可位于其他机器；`AAA` 和模型名称、端点需替换为实际值。
 
 ```powershell
-python -m hybrid_agent.run_windows_local --task "请下载一篇叫做AAA的论文" --model DECISION_MODEL --model-url http://MODEL_HOST:9028/v1 --planner-model PLANNER_MODEL --planner-url http://PLANNER_HOST:9028/v1 --ground-type ui-tars --ground-model UI-TARS-1.5-7B --ground-url http://GROUND_HOST:49999/v1 --max-steps 30 --result-dir ./runs/paper-001
+python -m hybrid_agent.run_windows_local --task-mode browser --task "请下载一篇叫做AAA的论文" --model DECISION_MODEL --model-url http://MODEL_HOST:9028/v1 --planner-model PLANNER_MODEL --planner-url http://PLANNER_HOST:9028/v1 --ground-type ui-tars --ground-model UI-TARS-1.5-7B --ground-url http://GROUND_HOST:49999/v1 --max-steps 30 --result-dir ./runs/paper-001
 ```
 
 macOS 本机运行使用同一套决策、浏览器 CDP、下载与验收逻辑；`run_local` 根据运行主机自动选择
@@ -510,7 +535,7 @@ macOS 或 Windows 适配器，Studio 的「本机任务」也自动选择，无�
 Studio 的「默认工程文件夹」可用系统文件夹选择器或绝对路径设置，选择会保存在本机；每天只在
 该目录下创建一个日期文件夹，当天任务的下载和运行日志都放在里面。浏览器通过 CDP 操作且不要求窗口固定位置，
 运行时可以拖动新启动的 Chrome 窗口。
-Windows 迁移时请保持解压后的目录名为 `hybrid_agent`，在它的父目录打开 PowerShell，使用 Python 3.12 和已安装的 Google Chrome：
+在 Windows 上安装 Studio 时，保留解压目录名 `hybrid_agent`，在其父目录打开 PowerShell 并使用 Python 3.12。下方的浏览器演示还需要 Google Chrome。
 
 ```powershell
 py -3.12 -m venv .venv
@@ -527,7 +552,7 @@ powershell -ExecutionPolicy Bypass -File hybrid_agent\scripts\start_studio_windo
 ```bash
 python3.12 -m venv hybrid_agent/.venv-mac
 hybrid_agent/.venv-mac/bin/python -m pip install -r hybrid_agent/requirements/requirements-mac.txt
-hybrid_agent/.venv-mac/bin/python -m hybrid_agent.run_local --task "打开 example.org"
+hybrid_agent/.venv-mac/bin/python -m hybrid_agent.run_local --task-mode browser --task "打开 example.org"
 ```
 
 浏览器任务通过专用 Chrome 和 CDP 工作。要执行 `observe_desktop` 及桌面鼠标键盘操作，
@@ -648,7 +673,7 @@ OCR 定位兜底仅使用唯一精确文字匹配，不会暗中额外调用决�
 
 ## 测试
 
-当前测试使用本机 Chromium 和模拟模型验证 MiniWoB++ 的页面观察、动作路由及环境评分。从 `hybrid_agent` 的父目录运行：
+默认测试覆盖桌面动作路由、AX 引用与执行回执、文件和窗口验收，以及 Studio 入口。MiniWoB++ 回归使用本机 Chromium 和模拟模型验证页面观察、动作路由及环境评分。设置 `HYBRID_AGENT_REAL_TERRA_REPORT=1` 可同时运行真实 Terra 的桌面报告核查。从 `hybrid_agent` 的父目录运行：
 
 ```bash
 python -m venv .venv

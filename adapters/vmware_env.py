@@ -17,7 +17,7 @@ from ..env import Environment, Observation, StepResult, run_local_command, run_l
 from .uno_commands import SET_CELL_VALUES_CMD, SAVE_DOC_CMD
 
 
-def to_pyautogui(action: Action, *, desktop_origin=None, keyboard_guard=False) -> str:
+def to_pyautogui(action: Action, *, desktop_origin=None, keyboard_guard=False, literal_click=False) -> str:
     """把新框架的 Action（env 类，已坐标化）翻译成 OSWorld 的 pyautogui 命令字符串。"""
     name = action.action
     a = dict(action.args)
@@ -62,7 +62,7 @@ def to_pyautogui(action: Action, *, desktop_origin=None, keyboard_guard=False) -
             # 判断：target 是单元格引用（如 E3 / Sheet1 的 A5）或描述里含"单元格"。
             t = str(a.get("target", "")).lower()
             import re
-            if re.fullmatch(r"[a-z]\d+", t.strip()) or "单元格" in a.get("target", ""):
+            if not literal_click and (re.fullmatch(r"[a-z]\d+", t.strip()) or "单元格" in a.get("target", "")):
                 return f"{head} pyautogui.click({x}, {y}); time.sleep(0.2); pyautogui.click({x}, {y})"
             return f"{head} pyautogui.click({x}, {y})"
         return ""  # grounding 失败：不执行，空转

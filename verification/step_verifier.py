@@ -12,6 +12,7 @@ from ..planning.context import PromptCompiler
 from ..model.decision_model import ChatModel
 from ..papers.paper_resolver import arxiv_id_from_url
 from ..papers.scholar_search import exact_scholar_titles, is_scholar, scholar_title_links
+from .judge_evidence import desktop_blocks, evidence_nodes, select_frame
 
 
 REVIEW_SYSTEM = """你是独立步骤核查员，不是操作员，没有执行工具。
@@ -153,6 +154,7 @@ def code_review(step, obs, execution_info, contract):
     blocks = [b for b in (obs.context if obs else []) if b.get("kind") == "browser_ax"]
     info = obs.info if obs else {}
     nodes = [n for b in blocks for n in b.get("nodes", [])]
+    desktop_nodes = evidence_nodes(obs) if desktop_blocks(obs) else []
     contracts = {c.get("id"): c for c in contract.get("checks", [])}
     for ident in step.get("check_ids", []):
         c = contracts.get(ident, {})
@@ -166,11 +168,14 @@ def code_review(step, obs, execution_info, contract):
             if sample.get('status') == 'executed':
                 fact = sample.get('file', {})
                 if kind == 'file_exists':
-                    ok = fact.get('exists') is True
+                    expected_type = {'file': 'is_file', 'directory': 'is_dir'}.get(predicate.get('file_type'))
+                    ok = fact.get('exists') is True and (not expected_type or fact.get(expected_type) is True)
                 elif kind == 'files_equal':
                     ok = sample.get('equal') is True
                 elif kind == 'file_absent':
                     ok = fact.get('exists') is False
+                elif type(sample.get('office_text_contains')) is bool:
+                    ok = sample['office_text_contains']
                 else:
                     ok = predicate['text'] in sample.get('stdout', '')
                     if not ok and sample.get('stdout_truncated'):
@@ -178,7 +183,8 @@ def code_review(step, obs, execution_info, contract):
                         continue
                 status, reason = ('passed' if ok else 'failed'), '目标机文件系统独立读取核查'
                 evidence = [json.dumps({'expected': predicate, 'observed': {k: sample[k] for k in
-                    ('file', 'other_file', 'equal', 'sha256', 'other_sha256', 'stdout', 'stdout_truncated') if k in sample}}, ensure_ascii=False)]
+                    ('file', 'other_file', 'equal', 'sha256', 'other_sha256', 'stdout', 'stdout_truncated',
+                     'content_scope', 'office_text_contains') if k in sample}}, ensure_ascii=False)]
             else:
                 reason = '目标机文件证据不可用：' + str(sample.get('reason', '未采集'))
         elif kind in {'download_complete', 'download_valid'}:
@@ -248,13 +254,13 @@ def code_review(step, obs, execution_info, contract):
                 checks.append({"kind": kind, **selection_check})
                 continue
             text = " ".join(predicate["text"].split()).casefold()
-            hits = [str(n.get("name", "")) for n in nodes
+            hits = [str(n.get("name", "")) for n in (desktop_nodes or nodes)
                     if text == " ".join(str(n.get("name", "")).split()).casefold() and not n.get("states", {}).get("hidden")]
             # Absence in a truncated AX is unknown, not proof of failure.
             if hits:
                 status, reason, evidence = "passed", "AX 中观察到目标文字", hits[:3]
-        elif kind == "element_state" and nodes:
-            hits = [n for n in nodes if n.get("name") == predicate["name"] and
+        elif kind == "element_state" and (desktop_nodes or nodes):
+            hits = [n for n in (desktop_nodes or nodes) if n.get("name") == predicate["name"] and
                     (not predicate.get("role") or predicate["role"] == n.get("role"))]
             if len(hits) == 1:
                 states = hits[0].get("states", {})
@@ -336,20 +342,32 @@ class StepReviewer:
             result['reason'] = '独立文字核查模型不可用，保留不确定'
         if self.model is None:
             return result
+        if packet and packet.get('visual_source_ids') and not getattr(self.model, 'vision', True):
+            result['reason'] = '独立文字核查模型无法查看报告引用的桌面截图'
+            return result
         cli_evidence = bool((getattr(obs, "info", None) or {}).get("cli_result") or (getattr(obs, "info", None) or {}).get("cli_checks"))
-        if not packet and (obs is None or (not cli_evidence and (obs.screenshot is None or (obs.info or {}).get("screenshot_stale") or not getattr(self.model, "vision", True)))):
-            result["reason"] = "缺少有效当前截图，不能进行视觉验收"
+        native = desktop_blocks(obs)
+        real_image = getattr(obs, 'screenshot', None) if not (getattr(obs, 'info', None) or {}).get('screenshot_stale') and getattr(self.model, 'vision', True) else None
+        if not packet and (obs is None or (not cli_evidence and real_image is None and not native)):
+            result["reason"] = "缺少有效当前观察证据，不能进行独立验收"
             return result
         if remaining_s is not None and remaining_s <= 0:
             result["reason"] = "任务等待预算已用尽"
             return result
         info = (obs.info if obs else {}) or {}
         supplemental = {k: info[k] for k in ("cli_result", "cli_checks", "runtime_state", "artifacts", "pending_downloads", "dialog", "tabs", "active_surface", "initial_state") if k in info}
-        blocks = list(obs.context if obs else []) + [{"kind": "supplemental", "text": json.dumps(supplemental, ensure_ascii=False)},
+        if info.get('active_surface') == 'desktop' and 'runtime_state' in supplemental:
+            runtime = supplemental['runtime_state']
+            supplemental['runtime_state'] = {**runtime, 'applications': [app for app in runtime.get('applications', []) if app.get('foreground') is True]}
+        if native:
+            frame = select_frame(obs, step, execution_info)
+            supplemental['desktop_ax'] = {k: frame[k] for k in ('nodes', 'desktop_windows', 'selection')}
+        blocks = [b for b in (obs.context if obs else []) if b.get('kind') != 'desktop_ax'] + [{"kind": "supplemental", "text": json.dumps(supplemental, ensure_ascii=False)},
                                      {"kind": "desktop_a11y", "text": (obs.text if obs else '') or ""}]
         # No policy claims or proposed final answer are supplied to the reviewer.
         required = json.dumps({"review_step": {k: step.get(k) for k in ("id", "goal", "expected_evidence", "verification", "planner_review_hint", "unresolved_requirements") if k in step},
-                               "code_review": code, "execution": {k: execution_info.get(k) for k in ("status", "error_code", "action")}}, ensure_ascii=False)
+                               "code_review": {k: v for k, v in code.items() if k != 'report_images'},
+                               "execution": {k: execution_info.get(k) for k in ("status", "error_code", "action")}}, ensure_ascii=False)
         messages, raw, started = [], "", time.monotonic()
         try:
             if packet:
@@ -358,10 +376,16 @@ class StepReviewer:
                     '你是独立审查员，不是正文撰写者。逐项检查全部 requirements；不要迎合先前结论。'
                     '只输出 JSON: {"status":"passed|failed|unknown","reason":"具体缺项或判断理由",'
                     '"evidence":["来源编号与支持或反驳正文的具体内容"]}。passed 必须有具体来源证据。'},
-                    {'role': 'user', 'content': json.dumps(packet, ensure_ascii=False)}]
+                    self.model.build_vision_message(json.dumps(packet, ensure_ascii=False),
+                        [(f'来源 [{ident}] 的桌面截图', image) for ident, image in code['report_images']])
+                    if code.get('report_images') and getattr(self.model, 'vision', True)
+                    else {'role': 'user', 'content': json.dumps(packet, ensure_ascii=False)}]
             else:
                 text, images, _ = self.compiler.compile(system=REVIEW_SYSTEM, task=task, memory="", auxiliary="", blocks=blocks,
-                    required=required, images=[("动作后的当前截图", obs.screenshot)], require_image=not bool(info.get("cli_result") or info.get("cli_checks")), focus=step.get("goal", ""))
+                    required=required, images=[("动作后的当前截图", real_image)] if real_image is not None else [],
+                    require_image=not (cli_evidence or native), focus=step.get("goal", ""))
+                if getattr(self.model, 'vision', True):
+                    images = [*images, *((f'来源 [{ident}] 的桌面截图', image) for ident, image in code.get('report_images', []))]
                 messages = [{"role": "system", "content": REVIEW_SYSTEM},
                             self.model.build_vision_message("独立步骤核查\n" + text, images)]
             cfg = getattr(getattr(self.model, "inner", self.model), "cfg", None)

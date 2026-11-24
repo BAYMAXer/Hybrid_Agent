@@ -58,6 +58,7 @@ def compile_plan(obj, task, public_spec, task_profile, paper_goals, *, repair=Fa
     steps = obj.get("steps") if isinstance(obj, dict) else None
     if not isinstance(steps, list) or not 1 <= len(steps) <= MAX_PLAN_STEPS:
         raise ValueError(f"steps 必须是非空子目标列表；资源上限为 {MAX_PLAN_STEPS} 项，请合并同一目标的零碎动作")
+    browser_workflow = task_profile.get('kind') not in {'desktop', 'cli'}
     # Refine before predicate validation, just as in the existing planner path.
     if task_profile.get("kind") == "paper_download" and len(paper_goals) == 1:
         steps = refine_paper_plan(steps, paper_goals)
@@ -86,7 +87,7 @@ def compile_plan(obj, task, public_spec, task_profile, paper_goals, *, repair=Fa
                              and p.get('id') in unresolved
                              and p.get('text') == unresolved[p['id']].get('text') else p)
                             for p in proposed]
-            if not check_ids or all(c.get('kind') == 'unresolved_requirement' for c in public_spec.get('checks', [])):
+            if browser_workflow and (not check_ids or all(c.get('kind') == 'unresolved_requirement' for c in public_spec.get('checks', []))):
                 fmt = 'ppt' if re.search(r'\b(?:pptx?|powerpoint)\b|幻灯片|演示文稿', task, re.I) else (
                     'pdf' if re.search(r'\bpdf\b', task, re.I) else 'any')
                 downloading = bool(re.search(r'下载|download|(?:保存|save).*(?:PPT|PDF|文件|file)',
@@ -118,7 +119,7 @@ def compile_plan(obj, task, public_spec, task_profile, paper_goals, *, repair=Fa
                     proposed.append(artifact_predicate)
             # Browser response filenames are unknown until the receipt exists.
             # A guessed filename must not become an extra user obligation.
-            if isinstance(proposed, list) and re.search(r'下载|download', task, re.I):
+            if browser_workflow and isinstance(proposed, list) and re.search(r'下载|download', task, re.I):
                 from pathlib import PurePosixPath
                 adjusted = []
                 for predicate in proposed:
@@ -140,6 +141,8 @@ def compile_plan(obj, task, public_spec, task_profile, paper_goals, *, repair=Fa
         except ValueError as exc:
             raise ValueError(f"第 {i} 个子目标 verification：{exc}") from exc
         for predicate in verification:
+            if not browser_workflow and predicate['kind'] in {'artifact_download', 'download_complete', 'download_valid'}:
+                raise ValueError('此任务模式不产生浏览器下载收据；用目标机路径或文件内容核查保存结果')
             if predicate['kind'] in {'download_complete', 'download_valid'} and predicate['check_id'] not in check_ids:
                 raise ValueError('下载谓词 check_id 必须引用已有系统条件')
         phase = str(step.get('phase') or '')
@@ -169,9 +172,9 @@ def compile_plan(obj, task, public_spec, task_profile, paper_goals, *, repair=Fa
             raise ValueError("流程阶段顺序必须为 " + " → ".join(ordered))
         if not isinstance(obj.get("keywords"), list) or not any(isinstance(k, str) and k.strip() for k in obj["keywords"]):
             raise ValueError("论文搜索必须提供非空 keywords")
-    if paper_goals:
+    if browser_workflow and paper_goals:
         normalized = compile_download_milestones(normalized, paper_goals)
-    paper_query = str(paper_goals[0].get('query') or paper_goals[0].get('title') or '').strip() if len(paper_goals) == 1 else ''
+    paper_query = str(paper_goals[0].get('query') or paper_goals[0].get('title') or '').strip() if browser_workflow and len(paper_goals) == 1 else ''
     return {"steps": normalized,
             "requirements": audit_requirement_proposals(task, obj.get("requirements")),
             "keywords": [paper_query] if paper_query else obj.get("keywords") if isinstance(obj.get("keywords"), list) else [],

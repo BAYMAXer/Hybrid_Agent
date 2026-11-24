@@ -39,6 +39,14 @@ def normalize_verification(value):
         if key and (not isinstance(item.get(key), str) or not item[key].strip() or len(item[key]) > 1000):
             raise ValueError(f"{kind} 需要非空 {key}")
         clean = {"kind": kind}
+        if kind == "file_exists" and "file_type" in item:
+            if item["file_type"] not in {"file", "directory"}:
+                raise ValueError("file_exists.file_type 必须是 file 或 directory")
+            clean["file_type"] = item["file_type"]
+        if kind in {"file_exists", "file_absent", "file_content", "files_equal"} and "scope" in item:
+            if item["scope"] not in {"milestone", "final"}:
+                raise ValueError("文件核查的 scope 必须是 milestone 或 final")
+            clean["scope"] = item["scope"]
         if key:
             clean[key] = item[key].strip()
         if kind == "url_equals" and urlsplit(clean["url"]).scheme not in {"https", "http"}:

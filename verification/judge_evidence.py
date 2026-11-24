@@ -11,6 +11,7 @@ from ..papers.paper_resolver import query_matches_title
 from ..papers.scholar_search import is_scholar, scholar_result_cards
 
 NODE_KEYS = ('ref', 'parent', 'id', 'role', 'name', 'value', 'states', 'href', 'in_viewport')
+NATIVE_NODE_KEYS = (*NODE_KEYS, 'direct', 'surface', 'window_ref', 'actions')
 ARTIFACT_KEYS = ('artifact_id', 'download_id', 'status', 'completed', 'path', 'bytes', 'size_bytes', 'url', 'final_url')
 
 
@@ -31,6 +32,68 @@ def nodes(obs):
             for n in b.get('nodes', []) if isinstance(n, dict)]
 
 
+def desktop_blocks(obs):
+    info = getattr(obs, 'info', None) or {}
+    snapshot = info.get('desktop_snapshot_id')
+    capture = info.get('desktop_capture_id')
+    return [block for block in (getattr(obs, 'context', None) or [])
+            if isinstance(block, dict) and block.get('kind') == 'desktop_ax' and not block.get('stale')
+            and (not snapshot or block.get('snapshot_id') == snapshot)
+            and (not capture or block.get('desktop_capture_id') == capture)]
+
+
+def visible_native_node(node):
+    if not isinstance(node, dict):
+        return None
+    states = node.get('states') or {}
+    if str(states.get('hidden', '')).casefold() == 'true':
+        return None
+    protected = (node.get('role') in {'password', 'passwordfield'}
+                 or any(str(states.get(key, '')).casefold() == 'true' for key in ('protected', 'password', 'is_password')))
+    return {k: v for k, v in node.items() if k != 'value'} if protected else node
+
+
+def evidence_nodes(obs):
+    if not (blocks := desktop_blocks(obs)):
+        return nodes(obs)
+    return [{**node, 'surface': 'desktop', 'window_ref': block.get('window_ref')}
+            for block in blocks for raw in block.get('nodes', []) if (node := visible_native_node(raw)) is not None]
+
+
+def desktop_window_transition(before, after, action_name, args, receipt, step_id):
+    """Retain measured window changes and dispatched shortcuts for whole-task review."""
+    samples = []
+    for obs in (before, after):
+        info = getattr(obs, 'info', None) or {}
+        runtime = info.get('runtime_state') or {}
+        if (info.get('task_mode') != 'desktop' or info.get('screenshot_stale') or not info.get('desktop_capture_id')
+                or runtime.get('source') != 'windows_window_api'):
+            return None
+        apps = runtime.get('applications', [])
+        fronts = [w for w in apps if w.get('foreground') is True and w.get('hwnd') and w.get('pid')]
+        if len(fronts) > 1:
+            return None
+        front = ({k: fronts[0][k] for k in ('hwnd', 'pid', 'process_name', 'title') if k in fronts[0]} if fronts else {})
+        if 'title' in front:
+            front['title'] = str(front['title'])[:140]
+        samples.append((front, apps, runtime.get('complete') is True, info['desktop_capture_id']))
+    previous, current = samples
+    dispatched = receipt.get('status') == 'executed' and receipt.get('dispatched') is True
+    keys = args.get('keys', []) if action_name == 'hotkey' and dispatched else []
+    if previous[0] == current[0] and not keys:
+        return None
+    result = {'step': step_id, 'before': previous[0], 'after': current[0],
+              'capture_ids': [previous[3], current[3]], 'source': 'windows_window_api'}
+    if dispatched:
+        result['dispatched_action'] = action_name
+        if keys:
+            result['keys'] = [str(k)[:20] for k in keys[:5]]
+    if previous[0] and current[2]:
+        result['previous_window_listed_after'] = any(w.get('hwnd') == previous[0]['hwnd'] and
+            w.get('pid') == previous[0]['pid'] for w in current[1])
+    return result
+
+
 def page_url(obs):
     return (getattr(obs, 'info', None) or {}).get('url') or next(
         (b.get('url', '') for b in (getattr(obs, 'context', None) or []) if b.get('kind') == 'browser_ax'), '')
@@ -49,7 +112,8 @@ def terms(value):
 
 
 def _key(node):
-    return ('id', node['id']) if node.get('id') else (node.get('role'), node.get('name', ''))
+    scope = (node.get('surface'), node.get('window_ref'))
+    return (*scope, 'id', node['id']) if node.get('id') else (*scope, node.get('role'), node.get('name', ''))
 
 
 def _values(node):
@@ -58,7 +122,9 @@ def _values(node):
 
 
 def target_identity(obs, args):
-    candidates = nodes(obs)
+    candidates = evidence_nodes(obs)
+    if args.get('window_ref'):
+        candidates = [n for n in candidates if n.get('window_ref') == args['window_ref']]
     if args.get('target_ref') is not None:
         candidates = [n for n in candidates if str(n.get('ref')) == str(args['target_ref'])]
     elif args.get('element_id'):
@@ -69,7 +135,7 @@ def target_identity(obs, args):
         return {}
     if len(candidates) != 1:
         return {}
-    return {k: candidates[0][k] for k in ('id', 'role', 'name', 'href') if k in candidates[0]}
+    return {k: candidates[0][k] for k in ('id', 'role', 'name', 'href', 'surface', 'window_ref') if k in candidates[0]}
 
 
 def select_frame(obs, step=None, execution=None, other=None, *, max_nodes=40):
@@ -77,7 +143,7 @@ def select_frame(obs, step=None, execution=None, other=None, *, max_nodes=40):
         return None
     step, execution = step or {}, execution or {}
     info = getattr(obs, 'info', None) or {}
-    all_nodes, other_nodes = nodes(obs), nodes(other)
+    all_nodes, other_nodes = evidence_nodes(obs), evidence_nodes(other)
     args = execution.get('args') or {}
     target = execution.get('target_node', {})
     focus = terms([step.get('goal'), step.get('expected_evidence'), step.get('verification'), args, target])
@@ -111,7 +177,8 @@ def select_frame(obs, step=None, execution=None, other=None, *, max_nodes=40):
     for _, index, _ in chosen:
         if len(indices) < max_nodes:
             indices.add(index)
-    selected = [{k: bounded(all_nodes[i][k], 180, 10) for k in NODE_KEYS if k in all_nodes[i]} for i in sorted(indices, key=lambda i: (-ranked[i][0], i))]
+    selected = [{k: bounded(node[k], 180, 10) for k in (NATIVE_NODE_KEYS if node.get('surface') == 'desktop' else NODE_KEYS)
+                 if k in node} for node in (all_nodes[i] for i in sorted(indices, key=lambda i: (-ranked[i][0], i)))]
     artifacts = [a for a in info.get('artifacts', []) if isinstance(a, dict)]
     old_ids = {a.get('artifact_id') or a.get('download_id') or a.get('path')
                for a in (getattr(other, 'info', None) or {}).get('artifacts', []) if isinstance(a, dict)}
@@ -164,7 +231,10 @@ def select_frame(obs, step=None, execution=None, other=None, *, max_nodes=40):
                      'pages': result_pages,
                      'scope': 'current observation browser AX snapshots only'} if cards else None
     runtime = info.get('runtime_state') or {}
-    apps = sorted(runtime.get('applications', []), key=lambda a: not a.get('foreground'))[:4]
+    apps = runtime.get('applications', [])
+    if info.get('active_surface') == 'desktop':
+        apps = [app for app in apps if app.get('foreground') is True]
+    apps = sorted(apps, key=lambda a: not a.get('foreground'))[:4]
     runtime_view = {k: runtime[k] for k in ('source', 'complete') if k in runtime}
     runtime_view['applications'] = [{k: bounded(a[k], 180, 6) for k in (
         'process_name', 'pid', 'hwnd', 'title', 'class_name', 'foreground', 'bounds',
@@ -190,6 +260,9 @@ def select_frame(obs, step=None, execution=None, other=None, *, max_nodes=40):
              'selection': {'nodes_total': len(all_nodes), 'nodes_selected': len(selected),
                            'artifacts_total': len(artifacts), 'artifacts_selected': len(selected_artifacts),
                            'truncated': len(selected) < len(all_nodes) or len(selected_artifacts) < len(artifacts)}}
+    if native := desktop_blocks(obs):
+        frame['desktop_windows'] = [{k: bounded(b[k], 240, 8) for k in (
+            'window_ref', 'title', 'app', 'complete', 'truncated') if k in b} for b in native[:4]]
     return frame
 
 
