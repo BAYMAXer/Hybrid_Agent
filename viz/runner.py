@@ -138,7 +138,7 @@ def main() -> None:
     })
 
     try:
-        result = agent.run(instruction)
+        result = agent.run(instruction, run_id=os.environ.get('AGENTS_VIZ_RUN_ID'))
     finally:
         env.close()
 

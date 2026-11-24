@@ -23,7 +23,35 @@ _results_dir = None          # 历史截图落盘目录（runner 设置）
 _results_prefix = ''         # 同一天平铺保存多次任务，避免覆盖
 _decisions = []              # 采集决策调用：{step, response, screenshot_file, elapsed}
 _groundings = []             # 采集 grounding 调用：{step, query, coord, elapsed}
-_log_queue = queue.Queue(maxsize=64)
+
+
+class _LiveLogQueue(queue.Queue):
+    """Prefer trajectory records to superseded previews when the UI falls behind."""
+
+    def enqueue(self, payload):
+        event = payload.get('event')
+        with self.not_empty:
+            drop = None
+            if event in ('live_frame', 'report_delta', 'run_metrics'):
+                drop = next((i for i, item in enumerate(self.queue)
+                             if item.get('event') == event and item.get('run_id') == payload.get('run_id')), None)
+            if drop is None and len(self.queue) >= self.maxsize:
+                if event in ('workbench_start', 'workbench_record', 'step_verification', 'execution_queue'):
+                    drop = next((i for i, item in enumerate(self.queue)
+                                 if item.get('event') in ('live_frame', 'report_delta', 'phase_timing')
+                                 or item.get('kind') == 'model'), None)
+                if drop is None:
+                    return False
+            if drop is None:
+                self.unfinished_tasks += 1
+            else:
+                del self.queue[drop]
+            self.queue.append(payload)
+            self.not_empty.notify()
+            return True
+
+
+_log_queue = _LiveLogQueue(maxsize=64)
 _log_worker = None
 _log_worker_lock = threading.Lock()
 _dropped_logs = 0
@@ -69,9 +97,12 @@ def _post(payload: dict) -> None:
                 _log_worker = threading.Thread(target=_log_worker_main, args=(_log_queue,),
                                                name="agent-viz-logs", daemon=True)
                 _log_worker.start()
-    try:
-        _log_queue.put_nowait(dict(payload))
-    except queue.Full:
+    payload = dict(payload)
+    run_id = os.environ.get('AGENTS_VIZ_RUN_ID')
+    if run_id:
+        payload['studio_run_id'] = run_id
+        payload.setdefault('run_id', run_id)
+    if not _log_queue.enqueue(payload):
         _dropped_logs += 1
 
 

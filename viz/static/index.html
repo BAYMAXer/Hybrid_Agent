@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>文鳐 Yaero · 工作空间</title>
+<script>if (location.protocol === 'file:') location.replace('open-studio.html');</script>
 <link rel="icon" type="image/svg+xml" href="/static/brand/yaero-app.svg">
 <link rel="alternate icon" type="image/png" sizes="32x32" href="/static/brand/yaero-app-32.png">
 <style>
@@ -511,7 +512,7 @@
               <label class="checkbox-row" title="勾选后保留任务浏览器的 Cookie 和站点存储；取消后每次使用临时隔离会话。"><input id="local-browser-session" type="checkbox" checked aria-describedby="local-browser-session-status">保留任务浏览器登录状态</label>
               <label class="field-label" for="local-task-mode">任务场景</label>
               <select id="local-task-mode"><option value="">本机默认</option><option value="desktop">Windows 通用桌面</option><option value="browser">浏览器</option><option value="cli">后台文件与终端</option></select>
-              <label class="checkbox-row"><input id="local-terra" type="checkbox">使用 GPT-6.1 Terra 验证三个模型角色</label>
+              <label class="checkbox-row"><input id="local-terra" type="checkbox" disabled>使用已授权的 GPT-6.1 Terra 执行决策、定位和核查</label>
               <label class="checkbox-row"><input id="local-visual-only" type="checkbox">纯视觉桌面验证（关闭 AX 和 OCR 回退）</label>
               <input id="local-browser-profile" type="hidden">
               <span id="local-browser-session-status" class="field-tip error" role="status" hidden></span>
@@ -526,7 +527,8 @@
               <div class="run-row"><label for="local-download-max-mib">下载上限（MiB，0 不限）</label><input id="local-download-max-mib" type="number" value="50" min="0" step="1"></div>
             </div>
             <div class="field-tip">框架等待下载时暂停决策，不消耗步数；任务时限仍然计时。</div>
-            <button id="btn-local-start" class="run-btn primary-launch">启动任务<svg><use href="#i-arrow"/></svg></button>
+            <button id="btn-local-start" class="run-btn primary-launch" type="button">下发任务并查看实时轨迹<svg><use href="#i-arrow"/></svg></button>
+            <div id="local-submit-status" class="field-tip" role="status"></div>
             <div class="batch-panel" style="margin-top:14px;padding-top:12px;border-top:1px dashed var(--border)">
               <label class="field-label" for="local-batch-file">批量运行（Excel 逐条任务）</label>
               <div class="run-row"><input id="local-batch-file" type="file" accept=".xlsx,.xls,.csv" style="flex:1"><button id="btn-local-batch" class="run-btn" type="button">批量运行</button><button id="btn-batch-stop" class="run-btn stop" type="button" style="display:none">停止</button></div>
@@ -724,6 +726,7 @@ function switchView(view) {
   const titles = {about:'关于文鳐 Yaero', knowledge:'知识库', 'jev-demo':'Jev 汇报演示', jev:'Jev 调试', run:'运行任务', live:'实时监控', collect:'SFT 采集', history:'虚拟机轨迹', local:'本机轨迹', debug:'模型调试', chat:'模型调试'};
   document.getElementById('studio-page-title').textContent = titles[view] || '工作空间';
   document.body.dataset.view = view;
+  if (view === 'live' || view === 'run') history.replaceState(null, '', '#' + view);
   if (view === 'collect' && window.CaptureStudio) window.CaptureStudio.open();
   const isRun = view === 'run';
   document.getElementById('view-live').classList.toggle('active', isLive);
@@ -743,6 +746,7 @@ function switchView(view) {
   if (view === 'debug') initDebugView();
   if (view === 'chat' && window.ModelLab) {window.ModelLab.open();if(openJev)window.ModelLab.setMode('jev');}
   if (isRun) initRunView();
+  if (isLive) pollRunStatus();
 }
 document.getElementById('brand-about').addEventListener('click', () => {
   switchView('about');
@@ -1847,6 +1851,7 @@ function fillPendingCard(card, payload) {
 /* ===== 运行视图 ===== */
 let runTasks = {};
 let runStatusTimer = null;
+let runStatusVersion = 0;
 
 function initRunView() {
   loadTaskList();
@@ -2112,13 +2117,12 @@ document.getElementById('btn-start').addEventListener('click', async () => {
       document.getElementById('btn-manual-eval').style.display = cfg.manual ? '' : 'none';
       // 记录任务总数
       if (d.task_total) totalTasks = d.task_total;
-      // 清空之前的实时视图状态（刷新一页，只显示本次运行）
-      resetLiveView();
-      pollRunStatus();
+      followSubmittedRun(d.run_id, cfg.task_id || cfg.domain || '');
       // 手动模式留在运行页（能看到「评估结果」按钮），普通模式自动切到实时监控
-      if (!cfg.manual) setTimeout(() => switchView('live'), 800);
+      if (cfg.manual) pollRunStatus();
+      else switchView('live');
     } else {
-      alert('启动失败: ' + (d.error || 'unknown'));
+      alert('启动失败：' + (d.detail || d.error || '服务未返回错误详情'));
     }
   }).catch(e => alert('启动请求失败: ' + e));
 });
@@ -2177,9 +2181,32 @@ document.getElementById('local-workspace-choose').addEventListener('click', asyn
 });
 const localTaskMode = document.getElementById('local-task-mode');
 const visualOnly = document.getElementById('local-visual-only');
+const localTerra = document.getElementById('local-terra');
+let executorPlatform = '';
+function localModelPreferenceKey() {
+  const mode = localTaskMode.value || (executorPlatform === 'win32' ? 'desktop' : 'default');
+  return 'yaero.local.terra.' + executorPlatform + '.' + mode;
+}
+function updateLocalModelPreference() {
+  let saved;
+  try { saved = localStorage.getItem(localModelPreferenceKey()); } catch {}
+  localTerra.checked = saved == null
+    ? executorPlatform === 'win32' && ['', 'desktop'].includes(localTaskMode.value)
+    : saved === 'true';
+}
+const executorReady = fetch('/runtime/info').then(r => r.json()).then(info => {
+  executorPlatform = info.platform || '';
+}).catch(() => {}).finally(() => {
+  updateLocalModelPreference();
+  localTerra.disabled = false;
+});
+localTerra.addEventListener('change', () => {
+  try { localStorage.setItem(localModelPreferenceKey(), String(localTerra.checked)); } catch {}
+});
 localTaskMode.addEventListener('change', () => {
   visualOnly.disabled = !['', 'desktop'].includes(localTaskMode.value);
   if (visualOnly.disabled) visualOnly.checked = false;
+  updateLocalModelPreference();
 });
 function localTaskOptions() {
   return {task_mode: localTaskMode.value || (visualOnly.checked ? 'desktop' : ''),
@@ -2187,12 +2214,28 @@ function localTaskOptions() {
     disable_desktop_ax: visualOnly.checked, disable_ocr_grounding: visualOnly.checked};
 }
 async function startLocalTask() {
-  let modePrompts;
-  try { modePrompts = await decisionPromptConfig(); } catch (e) { alert(e.message); return; }
+  const button = document.getElementById('btn-local-start');
+  const status = document.getElementById('local-submit-status');
+  const field = document.getElementById('local-task');
+  const task = field.value.trim();
+  if (button.disabled) return;
+  if (!task) { status.textContent = '请输入任务描述。'; field.focus(); return; }
+  button.disabled = true;
+  status.textContent = '正在下发任务…';
+  try {
+    await submitLocalTask(task);
+    status.textContent = '';
+  } catch (error) {
+    status.textContent = '下发失败：' + error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+async function submitLocalTask(task) {
+  await executorReady;
+  const modePrompts = await decisionPromptConfig();
   const options = localTaskOptions();
   const judge = decisionJudgeConfig(options.verification_backend === 'terra'); if (judge === null) return;
-  const task = document.getElementById('local-task').value.trim();
-  if (!task) { alert('请输入任务描述'); return; }
   let workspaceDir;
   try { workspaceDir = await saveWorkspaceDefault(); }
   catch (e) { setWorkspaceStatus(e.message, true); workspaceField.focus(); return; }
@@ -2219,23 +2262,19 @@ async function startLocalTask() {
     ground_api_key: document.getElementById('run-ground-apikey').value,
     ground_type: currentGroundType,
   };
-  fetch('/run/start', {
+  const response = await fetch('/run/start', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(cfg),
-  }).then(r => r.json()).then(d => {
-    if (d.ok) {
-      document.getElementById('run-form').style.display = 'none';
-      document.getElementById('run-running').style.display = '';
-      document.getElementById('btn-manual-eval').style.display = 'none';
-      totalTasks = 1;
-      resetLiveView();
-      pollRunStatus();
-      setTimeout(() => switchView('live'), 800);
-    } else {
-      alert('启动失败: ' + (d.error || 'unknown'));
-    }
-  }).catch(e => alert('启动请求失败: ' + e));
+  });
+  const result = await response.json();
+  if (!response.ok || !result.ok) throw new Error(result.detail || result.error || 'HTTP ' + response.status);
+  document.getElementById('run-form').style.display = 'none';
+  document.getElementById('run-running').style.display = '';
+  document.getElementById('btn-manual-eval').style.display = 'none';
+  totalTasks = 1;
+  followSubmittedRun(result.run_id, task);
+  switchView('live');
 }
 document.getElementById('btn-local-start').addEventListener('click', () => startLocalTask());
 
@@ -2245,6 +2284,7 @@ async function startBatch() {
   if (!file) { alert('请先选择 Excel / CSV 文件'); return; }
   let modePrompts, judge, workspaceDir;
   try { modePrompts = await decisionPromptConfig(); } catch (e) { alert(e.message); return; }
+  await executorReady;
   const options = localTaskOptions();
   judge = decisionJudgeConfig(options.verification_backend === 'terra'); if (judge === null) return;
   try { workspaceDir = await saveWorkspaceDefault(); } catch (e) { alert(e.message); return; }
@@ -2369,8 +2409,10 @@ document.getElementById('btn-manual-eval').addEventListener('click', () => {
 document.getElementById('btn-to-live').addEventListener('click', () => switchView('live'));
 
 function pollRunStatus() {
-  if (runStatusTimer) clearInterval(runStatusTimer);
+  clearTimeout(runStatusTimer);
+  const version = ++runStatusVersion;
   fetch('/run/status').then(r => r.json()).then(d => {
+    if (version !== runStatusVersion) return;
     window.AgentWorkbench?.updateRunner(d);
     const lastResult = document.getElementById('run-last-result');
     if (d.status === 'failed') {
@@ -2388,21 +2430,20 @@ function pollRunStatus() {
       document.getElementById('run-cur-step').textContent = (d.current_step || 0) + ' / ' + (d.max_steps || '?');
       document.getElementById('run-cur-elapsed').textContent = d.elapsed + ' s';
       document.getElementById('run-cur-pid').textContent = d.pid || '—';
-      runStatusTimer = setInterval(pollRunStatus, 2000);
+      runStatusTimer = setTimeout(pollRunStatus, 2000);
       fetch('/run/output').then(r => r.json()).then(d2 => {
-        document.getElementById('run-output').textContent = (d2.output || []).join('\n');
-      });
+        if (version === runStatusVersion) document.getElementById('run-output').textContent = (d2.output || []).join('\n');
+      }).catch(() => {});
     } else {
       document.getElementById('run-form').style.display = '';
       document.getElementById('run-running').style.display = 'none';
-      if (runStatusTimer) { clearInterval(runStatusTimer); runStatusTimer = null; }
       // 进程已结束但从未收到 task_end（如超时异常中断）：补一个失败态，避免卡在"待评分"
       if (!statusState.done) {
         statusState.done = true;
         setStatus('failed', '异常终止');
       }
     }
-  }).catch(() => {});
+  }).catch(() => { if (version === runStatusVersion) runStatusTimer = setTimeout(pollRunStatus, 2000); });
 }
 
 /* ===== 历史运行 ===== */
@@ -3078,31 +3119,87 @@ document.getElementById('debug-run').addEventListener('click', () => {
 document.getElementById('debug-copy').addEventListener('click', () => navigator.clipboard.writeText(debugOutput).then(() => { document.getElementById('debug-status').textContent = '已复制模型输出'; }).catch(() => {}));
 
 /* ===== 实时数据 ===== */
-let workbenchHistoryCursor = 0;
-function loadHistory() { fetch('/history').then(r => r.json()).then(d => { workbenchHistoryCursor = Math.max(workbenchHistoryCursor,d.cursor||0); (d.logs || []).forEach(addCard); }).catch(() => {}); }
-function poll() {
-  fetch('/history?since='+workbenchHistoryCursor).then(r => r.json()).then(d => {
-    workbenchHistoryCursor = Math.max(workbenchHistoryCursor,d.cursor||0);
-    (d.logs || []).forEach(l => {
-      const key = l.ts + '|' + l.kind + '|' + (l.type || l.event || '');
-      if (!seenKeys.has(key)) { seenKeys.add(key); addCard(l); }
-    });
-  }).catch(() => {});
+let liveRunId = '', historyCursor = 0, historyRequest = null, socket = null, needsHistory = false;
+function followSubmittedRun(runId, task) {
+  if (runId && runId !== liveRunId) {
+    historyRequest = null;
+    historyCursor = 0;
+    liveRunId = runId;
+    window.AgentWorkbench.waitFor(runId, task);
+  }
+  syncHistory();
+}
+function applyLiveEvent(event) {
+  if (!event._wb_seq || event._wb_seq <= historyCursor) return;
+  if (event.event === 'workbench_start') liveRunId = event.run_id;
+  if (event.run_id !== liveRunId) return;
+  addCard(event);
+  historyCursor = event._wb_seq;
+}
+async function syncHistory() {
+  if (historyRequest) return;
+  const request = {buffer: []};
+  historyRequest = request;
+  try {
+    const query = new URLSearchParams({since: String(historyCursor)});
+    if (liveRunId) query.set('run_id', liveRunId);
+    let response = await fetch('/history?' + query, {cache: 'no-store'});
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    let snapshot = await response.json();
+    if (historyRequest !== request) return;
+    if (liveRunId && snapshot.run_id !== liveRunId) {
+      // A task started elsewhere, or Studio restarted while this tab was disconnected.
+      response = await fetch('/history?since=0', {cache: 'no-store'});
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      snapshot = await response.json();
+      if (historyRequest !== request) return;
+      resetLiveView();
+      liveRunId = '';
+      historyCursor = 0;
+    }
+    needsHistory = false;
+    for (const event of snapshot.logs || []) applyLiveEvent(event);
+    historyCursor = snapshot.cursor || 0;
+    // Socket messages may cover a later interval than this HTTP snapshot.
+    historyRequest = null;
+    for (const event of request.buffer) receiveLiveEvent(event);
+    if (request.reconnected) syncHistory();
+  } catch {
+    if (historyRequest === request) needsHistory = true;
+  } finally {
+    if (historyRequest === request) historyRequest = null;
+  }
+}
+function receiveLiveEvent(event) {
+  if (!event._wb_seq || event._wb_seq <= historyCursor) return;
+  if (historyRequest) { historyRequest.buffer.push(event); return; }
+  if (event._wb_seq !== historyCursor + 1 || (liveRunId !== event.run_id && event.event !== 'workbench_start')) {
+    syncHistory();
+    return;
+  }
+  applyLiveEvent(event);
 }
 function connect() {
-  const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
-  ws.onopen = () => { document.getElementById('conn').className = 'conn on'; document.getElementById('conn-text').textContent = '已连接'; };
-  ws.onmessage = (e) => { try { const l = JSON.parse(e.data); const key = l.ts + '|' + l.kind + '|' + (l.type || l.event || ''); if (!seenKeys.has(key)) { seenKeys.add(key); addCard(l); } } catch (err) {} };
+  const ws = socket = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+  ws.onopen = () => {
+    document.getElementById('conn').className = 'conn on';
+    document.getElementById('conn-text').textContent = '已连接';
+    if (historyRequest) historyRequest.reconnected = true;
+    else syncHistory();
+  };
+  ws.onmessage = ({data}) => receiveLiveEvent(JSON.parse(data));
   ws.onclose = () => { document.getElementById('conn').className = 'conn off'; document.getElementById('conn-text').textContent = '断开，重连中…'; setTimeout(connect, 2000); };
   ws.onerror = () => ws.close();
 }
-loadHistory();
-connect();
-setInterval(poll, 2000);
-// 初始加载时切换到运行配置视图（正确隐藏状态栏 + 加载任务列表）
-switchView(location.hash === '#jev-demo' ? 'jev-demo' : 'run');
+document.addEventListener('DOMContentLoaded', () => {
+  connect();
+  syncHistory();
+  setInterval(() => { if (needsHistory || socket.readyState !== WebSocket.OPEN) syncHistory(); }, 2000);
+  switchView(location.hash === '#jev-demo' ? 'jev-demo' : location.hash === '#live' ? 'live' : 'run');
+});
 window.addEventListener('hashchange', () => {
   if (location.hash === '#jev-demo') switchView('jev-demo');
+  else if (location.hash === '#live') switchView('live');
   else if (location.hash === '#run') switchView('run');
 });
 </script>

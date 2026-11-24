@@ -523,7 +523,7 @@ def main(platform: str = 'windows') -> int:
             set_results_dir(args.result_dir, args.run_prefix or '')
         reset_collected()
         print(f"\n===== 任务开始 =====\n{args.task}\n")
-        result = agent.run(args.task)
+        result = agent.run(args.task, run_id=os.environ.get('AGENTS_VIZ_RUN_ID'))
         # Report the verdict immediately, while keeping the run busy until
         # cleanup finishes. Cleanup is not part of semantic verification.
         _lifecycle_status({"event": "verification_complete", "success": bool(result.success),

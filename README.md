@@ -541,12 +541,16 @@ Studio 的「默认工程文件夹」可用系统文件夹选择器或绝对路�
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r hybrid_agent\requirements\requirements-windows.txt
 .\.venv\Scripts\python.exe -m playwright install chromium
-Copy-Item hybrid_agent\.env.example hybrid_agent\.env
-# 在 hybrid_agent\.env 中填写本机的 DASHSCOPE_API_KEY
-powershell -ExecutionPolicy Bypass -File hybrid_agent\scripts\start_studio_windows.ps1
+# 使用需要 API Key 的自有模型时，可将 hybrid_agent\.env.example 复制为 .env 后填写相应密钥
 ```
 
-打开 `http://127.0.0.1:8090`，先选择默认工程文件夹。普通任务可以直接输入“搜索论文 Attention is all you need 并下载 PDF 到默认工程文件夹”；“稳定演示：本地标题搜索回放 → 官方 PDF 下载”按钮会将这句话送给规划与决策模型，同时仅把已标注的本地搜索回放页设为浏览器初始状态。论文 ID、作者与 PDF 地址不作为预填任务条件，须从搜索结果和官方页面获得。本地回放可以演示操作与核验链路，但不能宣称 arXiv 在线搜索已通过。Windows 专用 Chrome 以无启动窗口方式连接 CDP，再由隔离任务上下文创建一扇可拖动的任务窗口；任务结束后关闭本次专用浏览器。
+**从界面下发任务。** 在 Windows 上双击仓库根目录的 `start_studio.cmd`。服务就绪后会打开 [运行任务](http://127.0.0.1:8090/#run)。运行期间请保留启动窗口。也可在 PowerShell 中执行 `powershell -ExecutionPolicy Bypass -File hybrid_agent\scripts\start_studio_windows.ps1 -OpenBrowser`，用 `-Port` 指定其他端口。
+
+1. 在「运行任务 → 本机任务」确认工程文件夹。通用桌面任务选择「Windows 通用桌面」，默认使用已授权的 GPT-6.1 Terra。使用自有模型时，取消勾选 Terra 并填写模型配置。
+2. 输入任务并点击「下发任务并查看实时轨迹」。界面会进入「实时监控」，随执行进度展示规划、动作、截图和核查结果。可以查看动作前后的截图，并随时回到最新动作。
+3. 刷新页面或连接中断后可继续查看当前运行。任务结束后，在「本机轨迹」按任务打开完整记录。
+
+如需浏览器演示，选择浏览器场景后可直接下发“搜索论文 Attention is all you need 并下载 PDF 到默认工程文件夹”。「本地标题搜索回放 → 官方 PDF 下载」演示使用本地搜索回放页作为起点，论文 ID、作者和 PDF 地址由 Agent 根据观察确定。该演示验证操作与核验链路，在线搜索需要另行测试。Windows 专用 Chrome 连接 CDP 后会创建可拖动的任务窗口，任务结束后关闭本次专用浏览器。
 在 macOS 安装依赖并运行（仍从 `hybrid_agent` 的父目录执行）：
 
 ```bash

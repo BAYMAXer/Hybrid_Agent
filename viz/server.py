@@ -36,7 +36,7 @@ app = FastAPI(title="osworld_agent Viz")
 async def runtime_info():
     """Identify the actual executor host, including through an SSH tunnel."""
     return {'service': 'yaero-studio', 'platform': sys.platform,
-            'local_execution': True}
+            'project_root': str(_PKG), 'local_execution': True}
 
 
 from .jev_debug import router as jev_router
@@ -146,7 +146,7 @@ def _cache_workbench(payload):
     """
     global _workbench_sequence, _workbench_run
     event = payload.get('event')
-    if event == 'workbench_start':
+    if event == 'workbench_start' and payload.get('run_id') != _workbench_run:
         _workbench_cache.clear()
         _workbench_run = payload.get('run_id')
     if not _workbench_run or payload.get('run_id') != _workbench_run:
@@ -163,13 +163,21 @@ def _cache_workbench(payload):
         ident = ((record.get('call') or {}).get('call_id') if kind == 'model_call' else
                  record.get('revision') if kind == 'plan_revision' else
                  record.get('parent_decision_id') or record.get('step'))
-        key = (event, kind, ident or record.get('event_id'))
+        key = (event, kind) if kind in ('episode_end', 'episode_error') else (event, kind, ident or record.get('event_id'))
     elif event == 'step_verification':
         key = (event, payload.get('review_id'), payload.get('method'))
     elif event == 'execution_queue':
         key = (event, (payload.get('queue') or {}).get('revision'))
     elif event == 'framework_wait':
         key = (event, payload.get('step'))
+    if event == 'workbench_start' and key in _workbench_cache:
+        # The local runner repeats the submission. A benchmark runner resolves
+        # its task ID to an instruction later, which existing clients also need.
+        key = (event, 'instruction')
+        previous = _workbench_cache.get(key, _workbench_cache[event])
+        if payload.get('instruction') == previous.get('instruction'):
+            payload.update(ts=previous['ts'], _wb_seq=previous['_wb_seq'])
+            return
     _workbench_sequence += 1
     payload['_wb_seq'] = _workbench_sequence
     _workbench_cache[key] = dict(payload)
@@ -186,7 +194,7 @@ os.environ["no_proxy"] = _no_proxy
 _agent_state = {
     "status": "idle", "proc": None, "task_name": None, "config": None,
     "start_time": None, "output": [], "current_step": 0, "max_steps": 0, "task_total": 0,
-    "last_error": "",
+    "last_error": "", "run_id": None,
 }
 
 # Human demonstrations use their own browser context and never invoke a model.
@@ -200,14 +208,16 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 atexit.register(collection.close)
 
 
-def _reader_thread(proc, timing_path=None, started=None):
+def _reader_thread(proc, timing_path=None, started=None, loop=None):
+    output = _agent_state['output']
+    run_id = _agent_state['run_id']
     try:
         for line in proc.stdout:
             line = line.rstrip("\n")
-            if line:
-                _agent_state["output"].append(line)
-                if len(_agent_state["output"]) > 500:
-                    _agent_state["output"] = _agent_state["output"][-500:]
+            if line and _agent_state.get('proc') is proc:
+                output.append(line)
+                if len(output) > 500:
+                    del output[:-500]
     except Exception:
         pass
     finally:
@@ -222,15 +232,51 @@ def _reader_thread(proc, timing_path=None, started=None):
                 os.replace(temporary, path)
             except OSError:
                 pass
-        if _agent_state.get('proc') is proc:
-            _agent_state['elapsed_final'] = elapsed
-        if _agent_state.get('proc') is proc and _agent_state["status"] == "running":
-            _agent_state["status"] = "done" if rc == 0 else "failed"
-            if rc != 0:
-                _agent_state["last_error"] = next(
-                    (line for line in reversed(_agent_state["output"])
-                     if re.match(r"^[\w.]+(?:Error|Exception):", line)),
-                    f"任务进程退出，代码 {rc}。可查看运行输出。")
+        outcome = None
+        if not rc and timing_path and _agent_state['proc'] is proc and not _has_terminal_record():
+            outcome = _saved_outcome(timing_path, run_id)
+        if loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(_finish_run, proc, rc, elapsed, outcome)
+        elif loop is None:
+            _finish_run(proc, rc, elapsed, outcome)
+
+
+def _has_terminal_record():
+    return any(('workbench_record', kind) in _workbench_cache for kind in ('episode_end', 'episode_error'))
+
+
+def _saved_outcome(timing_path, run_id):
+    # Load large trajectories off the event loop only if the child's transport
+    # failed to deliver its terminal record. A result directory may be reused.
+    try:
+        traj = json.loads(Path(timing_path).with_name('trajectory.json').read_text(encoding='utf-8'))
+        manifest = traj.get('run_manifest') if isinstance(traj, dict) else None
+        if isinstance(manifest, dict) and manifest.get('run_id') == run_id and isinstance(traj.get('outcome'), dict):
+            return traj['outcome']
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _finish_run(proc, rc, elapsed, outcome):
+    if _agent_state.get('proc') is not proc or _agent_state['status'] != 'running':
+        return
+    _agent_state['elapsed_final'] = elapsed
+    if _agent_state.get('stop_requested'):
+        _agent_state.update(status='idle', proc=None, stop_requested=False, last_error='任务已停止')
+    else:
+        _agent_state['status'] = 'done' if rc == 0 else 'failed'
+    if _agent_state['status'] == 'failed':
+        _agent_state['last_error'] = next(
+            (line for line in reversed(_agent_state['output'])
+             if re.match(r"^[\w.]+(?:Error|Exception):", line)),
+            f"任务进程退出，代码 {rc}。可查看运行输出。")
+    if _has_terminal_record():
+        return
+    if outcome is not None:
+        _publish_terminal('episode_end', outcome=outcome)
+    else:
+        _publish_terminal('episode_error', error_type=_agent_state['last_error'] or '进程已结束，未收到任务结果')
 
 
 # ================= 实时日志 ================= #
@@ -297,6 +343,16 @@ async def receive_log(request: Request):
         payload = await request.json()
     except Exception:
         return {"ok": False, "error": "invalid json"}
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "日志必须是对象"}
+    run_id = payload.get('run_id')
+    producer = payload.get('studio_run_id')
+    if producer and (producer != _workbench_run or producer != run_id):
+        return {"ok": True, "ignored": True}
+    if _agent_state['status'] in ('starting', 'running') and run_id != _agent_state['run_id']:
+        return {"ok": True, "ignored": True}
+    if run_id and _workbench_run and run_id != _workbench_run and payload.get('event') != 'workbench_start':
+        return {"ok": True, "ignored": True}
     if payload.get('event') == 'jev_call':
         payload = {**payload, 'call': _jev_call_for_ui(payload.get('call'))}
     elif payload.get('event') == 'paper_identity_review':
@@ -306,7 +362,14 @@ async def receive_log(request: Request):
         if isinstance(payload.get('calls'), list):
             payload['calls'] = [call for item in payload['calls']
                                 if (call := _paper_identity_call_for_ui(item)) is not None]
+    _publish_log(payload)
+    return {"ok": True, "total": len(logs)}
+
+
+def _publish_log(payload):
     payload.setdefault("ts", time.time())
+    if payload.get('event') == 'workbench_start' and payload.get('run_id') != _workbench_run:
+        logs.clear()
     _cache_workbench(payload)
     stored = dict(payload)
     # 保留 screenshot：前端 poll() 从 /history 拿日志渲染，去掉截图会导致实时监控截图缺失
@@ -323,38 +386,61 @@ async def receive_log(request: Request):
             _agent_state["current_step"] = max(_agent_state["current_step"] or 0, int(payload["step"]))
         elif ev == "task_start":
             _agent_state["current_step"] = 0
-    msg = json.dumps(payload, ensure_ascii=False)
-    dead = []
-    for ws in clients:
-        try:
-            await ws.send_text(msg)
-        except Exception:
-            dead.append(ws)
-    for ws in dead:
-        clients.remove(ws)
-    return {"ok": True, "total": len(logs)}
+        elif ev == "workbench_record" and (payload.get('record') or {}).get('event_type') == 'action_context':
+            step = payload['record'].get('step')
+            if isinstance(step, int):
+                _agent_state["current_step"] = max(_agent_state["current_step"] or 0, step)
+    # Each WebSocket has one writer. A slow/disconnected browser never stalls
+    # the worker posting observations. A reconnect can recover from /history.
+    for pending in clients:
+        if pending.full():
+            pending.get_nowait()
+        pending.put_nowait(stored)
+
+
+def _publish_terminal(event_type, **fields):
+    run_id = _agent_state['run_id']
+    _publish_log({'kind': 'status', 'event': 'workbench_record', 'run_id': run_id,
+                  'record': {'event_type': event_type, 'event_id': f'{run_id}:process_end',
+                             'elapsed_s': _agent_state.get('elapsed_final'), **fields}})
+
+
+async def _send_logs(ws, pending):
+    while True:
+        payload = await pending.get()
+        await ws.send_text(json.dumps(payload, ensure_ascii=False))
+
+
+async def _wait_for_disconnect(ws):
+    while True:
+        await ws.receive_text()
 
 
 @app.get("/history")
-async def history(since: int = 0):
+async def history(since: int = 0, run_id: str | None = None):
+    if run_id and run_id != _workbench_run:
+        return {'logs': [], 'cursor': _workbench_sequence, 'run_id': _workbench_run}
+    if since > _workbench_sequence:
+        since = 0
     if _workbench_cache:
         return {'logs': sorted((v for v in _workbench_cache.values() if v['_wb_seq'] > since), key=lambda v:v['_wb_seq']),
-                'cursor': _workbench_sequence}
-    return {"logs": logs, 'cursor': 0}
+                'cursor': _workbench_sequence, 'run_id': _workbench_run}
+    return {"logs": logs, 'cursor': 0, 'run_id': _workbench_run}
 
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
-    clients.append(ws)
+    pending = asyncio.Queue(maxsize=16)
+    clients.append(pending)
+    handlers = [asyncio.create_task(_send_logs(ws, pending)), asyncio.create_task(_wait_for_disconnect(ws))]
     try:
-        while True:
-            await ws.receive_text()
-    except Exception:
-        pass
+        await asyncio.wait(handlers, return_when=asyncio.FIRST_COMPLETED)
     finally:
-        if ws in clients:
-            clients.remove(ws)
+        clients.remove(pending)
+        for handler in handlers:
+            handler.cancel()
+        await asyncio.gather(*handlers, return_exceptions=True)
 
 
 @app.get("/")
@@ -1123,6 +1209,35 @@ def _local_task_options(cfg):
     return mode, args
 
 
+def _launch_runner(cfg, cmd, task, max_steps, viz_port, *, timing_path=None, extra_env=None):
+    run_id = uuid.uuid4().hex
+    env = os.environ.copy()
+    env.update(PYTHONIOENCODING='utf-8', PYTHONUNBUFFERED='1', AGENTS_VIZ_RUN_ID=run_id,
+               AGENTS_VIZ_SERVER_URL=f"http://127.0.0.1:{viz_port or os.getenv('AGENTS_VIZ_PORT', '8088')}",
+               AGENTS_RESULTS_DIR=RESULTS_DIR, **(extra_env or {}))
+    env['NO_PROXY'] = env['no_proxy'] = "192.168.0.0/16,10.0.0.0/8,7.0.0.0/8,localhost,127.0.0.1"
+    started = time.perf_counter()
+    _agent_state.update(run_id=run_id, status='starting', proc=None, task_name=task[:60], config=cfg,
+                        output=[], last_error='', current_step=0, max_steps=max_steps, task_total=1,
+                        start_time=time.time(), started_monotonic=started, elapsed_final=None, stop_requested=False)
+    _publish_log({'kind': 'status', 'event': 'workbench_start', 'instruction': task,
+                  'run_id': run_id, 'max_steps': max_steps})
+    try:
+        proc = subprocess.Popen(cmd, cwd=AGENT_ROOT, env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace')
+    except (OSError, ValueError) as exc:
+        _agent_state.update(status='failed', last_error=str(exc), elapsed_final=time.perf_counter() - started)
+        _publish_terminal('episode_error', error_type=str(exc))
+        return {'ok': False, 'error': str(exc), 'run_id': run_id}
+    _agent_state.update(proc=proc, status='running')
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    threading.Thread(target=_reader_thread, args=(proc, timing_path, started, loop), daemon=True).start()
+    return {'ok': True, 'task': _agent_state['task_name'], 'task_total': 1, 'run_id': run_id}
+
+
 def _start_local(cfg: dict, viz_port: int | None = None):
     """启动当前主机平台的本机任务，复用 _reader_thread + /log + /ws。"""
     task = str(cfg.get("task") or "").strip()
@@ -1152,37 +1267,8 @@ def _start_local(cfg: dict, viz_port: int | None = None):
         with open(contract_path, "w", encoding="utf-8") as f:
             json.dump(contract, f, ensure_ascii=False, indent=2)
         cmd += ["--completion-spec", contract_path]
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONUNBUFFERED"] = "1"
-    env["AGENTS_VIZ_SERVER_URL"] = f"http://127.0.0.1:{viz_port or os.getenv('AGENTS_VIZ_PORT', '8088')}"
-    env["AGENTS_RESULTS_DIR"] = RESULTS_DIR
-    env["NO_PROXY"] = "192.168.0.0/16,10.0.0.0/8,7.0.0.0/8,localhost,127.0.0.1"
-    env["no_proxy"] = env["NO_PROXY"]
-
-    _agent_state["task_name"] = task[:60]
-    _agent_state["task_total"] = 1
-    _agent_state["config"] = cfg
-    _agent_state["output"] = []
-    _agent_state["last_error"] = ""
-    _agent_state["current_step"] = 0
-    _agent_state["max_steps"] = max_steps
-    _agent_state["start_time"] = time.time()
-    _agent_state["started_monotonic"] = time.perf_counter()
-    _agent_state["elapsed_final"] = None
-    _agent_state["status"] = "starting"
-    logs.clear()
-    try:
-        proc = subprocess.Popen(cmd, cwd=AGENT_ROOT, env=env,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, encoding="utf-8", errors="replace")
-        _agent_state["proc"] = proc
-        _agent_state["status"] = "running"
-        threading.Thread(target=_reader_thread, args=(proc, os.path.join(result_dir, "run_timing.json"), _agent_state["started_monotonic"]), daemon=True).start()
-        return {"ok": True, "task": _agent_state["task_name"], "task_total": 1}
-    except Exception as e:
-        _agent_state["status"] = "failed"
-        return {"ok": False, "error": str(e)}
+    return _launch_runner(cfg, cmd, task, max_steps, viz_port,
+                          timing_path=os.path.join(result_dir, "run_timing.json"))
 
 
 def _wait_cli_args(cfg):
@@ -1415,13 +1501,15 @@ def _read_run_result(result_dir):
             'elapsed_s': m.get('elapsed_s')}
 
 
-def _run_batch_worker(base_cmd, tasks):
+def _run_batch_worker(base_cmd, tasks, *, viz_port=None):
     from ..runtime.workspace_config import allocate_local_result_dir
     report_path = os.path.join(LOCAL_RUNS_DIR, 'batch_report_' + time.strftime('%Y%m%d_%H%M%S') + '.csv')
     results = []
     env = os.environ.copy()
     env['PYTHONIOENCODING'] = 'utf-8'
     env['PYTHONUNBUFFERED'] = '1'
+    env.pop('AGENTS_VIZ_RUN_ID', None)
+    env['AGENTS_VIZ_SERVER_URL'] = f"http://127.0.0.1:{viz_port or os.getenv('AGENTS_VIZ_PORT', '8088')}"
     env['NO_PROXY'] = '192.168.0.0/16,10.0.0.0/8,7.0.0.0/8,localhost,127.0.0.1'
     env['no_proxy'] = env['NO_PROXY']
     try:
@@ -1469,14 +1557,14 @@ def _run_batch_worker(base_cmd, tasks):
 async def start_batch(request: Request):
     import base64
     import tempfile
-    if _batch_state['running']:
-        return {"ok": False, "error": "批量运行进行中，请先停止"}
     try:
         body = await request.json()
     except Exception:
         return {"ok": False, "error": "invalid json"}
     if not isinstance(body, dict):
         return {"ok": False, "error": "批量请求必须是对象"}
+    if _batch_state['running'] or _runner_busy():
+        return {"ok": False, "error": "已有任务在运行中，请先停止"}
     filename = body.get('filename') or ''
     ext = os.path.splitext(filename)[1].lower()
     if ext not in {'.xlsx', '.xls', '.csv'}:
@@ -1510,7 +1598,8 @@ async def start_batch(request: Request):
         return {"ok": False, "error": str(exc)}
     _batch_state.update(running=True, total=len(tasks), done=0, current='',
                         results=[], error='', stop=False, report_path='', started_at=time.time())
-    threading.Thread(target=_run_batch_worker, args=(base_cmd, tasks), daemon=True).start()
+    port = getattr(getattr(request, 'url', None), 'port', None)
+    threading.Thread(target=_run_batch_worker, args=(base_cmd, tasks), kwargs={'viz_port': port}, daemon=True).start()
     return {"ok": True, "total": len(tasks)}
 
 
@@ -1525,18 +1614,25 @@ async def stop_batch():
     return {"ok": True}
 
 
+def _runner_busy():
+    proc = _agent_state['proc']
+    return _agent_state['status'] == 'starting' or (
+        _agent_state['status'] == 'running' and (bool(_agent_state.get('stop_requested'))
+                                                or (proc is not None and proc.poll() is None)))
+
+
 @app.post("/run/start")
 async def start_run(request: Request):
-    if collection.active:
-        return {"ok": False, "error": "人工采集进行中，请先结束采集。"}
-    if _agent_state["status"] == "running":
-        return {"ok": False, "error": "已有任务在运行中，请先停止"}
     try:
         cfg = await request.json()
     except Exception:
         return {"ok": False, "error": "invalid json"}
     if not isinstance(cfg, dict):
         return {"ok": False, "error": "任务配置必须是对象"}
+    if collection.active:
+        return {"ok": False, "error": "人工采集进行中，请先结束采集。"}
+    if _runner_busy() or _batch_state['running']:
+        return {"ok": False, "error": "已有任务在运行中，请先停止"}
 
     from ..planning.prompt_settings import validate_mode_prompts
     try:
@@ -1590,39 +1686,8 @@ async def start_run(request: Request):
     if vm_path:
         cmd += ["--vm-path", vm_path]
 
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONUNBUFFERED"] = "1"
-    env["AGENTS_VIZ_SERVER_URL"] = f"http://127.0.0.1:{request.url.port or os.getenv('AGENTS_VIZ_PORT', '8088')}"
-    env["AGENTS_RESULTS_DIR"] = RESULTS_DIR
-    env["NO_PROXY"] = "192.168.0.0/16,10.0.0.0/8,7.0.0.0/8,localhost,127.0.0.1"
-    env["no_proxy"] = env["NO_PROXY"]
-    # 本地 proxy 任务的上游代理：用 HIS 活 IP，否则 _proxy_setup 起不来 tinyproxy
-    env["OSWORLD_UPSTREAM_PROXY"] = os.environ.get("OSWORLD_UPSTREAM_PROXY") or "http://172.18.94.109:8080"
-
-    _agent_state["task_name"] = f"{domain}/{task_id}"
-    _agent_state["task_total"] = 1
-    _agent_state["config"] = cfg
-    _agent_state["output"] = []
-    _agent_state["last_error"] = ""
-    _agent_state["current_step"] = 0
-    _agent_state["max_steps"] = max_steps
-    _agent_state["start_time"] = time.time()
-    _agent_state["started_monotonic"] = time.perf_counter()
-    _agent_state["elapsed_final"] = None
-    _agent_state["status"] = "starting"
-    logs.clear()
-    try:
-        proc = subprocess.Popen(cmd, cwd=AGENT_ROOT, env=env,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, encoding="utf-8", errors="replace")
-        _agent_state["proc"] = proc
-        _agent_state["status"] = "running"
-        threading.Thread(target=_reader_thread, args=(proc, None, _agent_state["started_monotonic"]), daemon=True).start()
-        return {"ok": True, "task": _agent_state["task_name"], "task_total": 1}
-    except Exception as e:
-        _agent_state["status"] = "failed"
-        return {"ok": False, "error": str(e)}
+    extra_env = {'OSWORLD_UPSTREAM_PROXY': os.environ.get('OSWORLD_UPSTREAM_PROXY') or "http://172.18.94.109:8080"}
+    return _launch_runner(cfg, cmd, f'{domain}/{task_id}', max_steps, request.url.port, extra_env=extra_env)
 
 
 @app.get("/run/status")
@@ -1631,6 +1696,7 @@ async def run_status():
     if elapsed is None:
         elapsed = time.perf_counter() - _agent_state["started_monotonic"] if _agent_state.get("started_monotonic") else 0
     return {
+        "run_id": _agent_state["run_id"],
         "status": _agent_state["status"],
         "task": _agent_state["task_name"],
         "current_step": _agent_state["current_step"],
@@ -1662,11 +1728,16 @@ def _stop_runner_process(proc):
 @app.post("/run/stop")
 async def stop_run():
     proc = _agent_state["proc"]
-    if proc:
-        _stop_runner_process(proc)
-    _agent_state["status"] = "idle"
-    _agent_state["proc"] = None
-    _agent_state["task_name"] = None
+    if proc and _agent_state['status'] == 'running' and proc.poll() is None and not _agent_state.get('stop_requested'):
+        _agent_state['stop_requested'] = True
+        try:
+            await asyncio.to_thread(_stop_runner_process, proc)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            if proc.poll() is None:
+                _agent_state['stop_requested'] = False
+                return {'ok': False, 'error': str(exc)}
+        elapsed = time.perf_counter() - _agent_state['started_monotonic']
+        _finish_run(proc, proc.poll(), elapsed, None)
     return {"ok": True}
 
 
