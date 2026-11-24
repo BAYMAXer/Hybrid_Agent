@@ -97,7 +97,11 @@ def to_pyautogui(action: Action, *, desktop_origin=None, keyboard_guard=False, l
     if name == "press":
         return f"{head}{guard} pyautogui.press({str(a.get('key', ''))!r})"
     if name == "hotkey":
-        keys = list(a.get("keys", []))
+        keys = a.get("keys")
+        if not isinstance(keys, (list, tuple)) or not keys or not all(isinstance(key, str) and key for key in keys):
+            return ""
+        # PyAutoGUI adds Shift for uppercase letters. In a chord Shift is an explicit key.
+        keys = [key.lower() if key.isascii() else key for key in keys]
         return f"{head}{guard} pyautogui.hotkey(*{keys!r})"
     if name == "goto":
         url = str(a.get("url", ""))

@@ -2204,6 +2204,7 @@ class BrowserSession:
     # ---- 纯 CDP 浏览器动作（不动真实鼠标键盘）----
     _KEY_MAP = {
         "ctrl": "ControlOrMeta", "control": "ControlOrMeta", "cmd": "Meta", "win": "Meta",
+        "meta": "Meta", "controlormeta": "ControlOrMeta",
         "esc": "Escape", "escape": "Escape", "return": "Enter", "enter": "Enter",
         "del": "Delete", "delete": "Delete", "backspace": "Backspace",
         "up": "ArrowUp", "down": "ArrowDown", "left": "ArrowLeft", "right": "ArrowRight",
@@ -2215,6 +2216,26 @@ class BrowserSession:
     def _norm_key(cls, key):
         k = (key or "").strip().lower()
         return cls._KEY_MAP.get(k, key)
+
+    @classmethod
+    def _keyboard_binding(cls, action):
+        if action.action == "press":
+            key = cls._norm_key(str(action.args.get("key", "")))
+        else:
+            keys = []
+            for token in action.args.get("keys", []):
+                # A Playwright physical letter code lets the explicit Shift modifier
+                # determine KeyboardEvent.key. Literal "A" already means uppercase.
+                if re.fullmatch(r"[A-Za-z]", token):
+                    keys.append("Key" + token.upper())
+                elif re.fullmatch(r"[fF](?:[1-9]|1[0-2])", token):
+                    keys.append(token.upper())
+                else:
+                    keys.append(cls._norm_key(token))
+            key = "+".join(keys)
+        if not key:
+            raise BrowserActionError("Missing key", code="unsupported")
+        return key
 
     @browser_thread
     def goto(self, url):
@@ -2583,10 +2604,7 @@ class BrowserSession:
                     page.evaluate("delta => window.scrollBy(0, delta)", delta)
                 scroll_info = self._finish_scroll_measurement(page, cdp, measurement, delta, wheel=point_scroll)
             elif name in {"press", "hotkey"}:
-                key = (self._norm_key(str(args.get("key", ""))) if name == "press" else
-                       "+".join(self._norm_key(k) for k in args.get("keys", [])))
-                if not key:
-                    raise BrowserActionError("Missing key", code="unsupported")
+                key = self._keyboard_binding(action)
                 dispatched = True
                 page.keyboard.press(key)
             return {"status": "executed" if dispatched else "rejected", "dispatched": dispatched,
@@ -2712,14 +2730,9 @@ class BrowserSession:
             name = action.action
             if name in ("press", "hotkey"):
                 # 键盘动作不需要 locator
+                key = self._keyboard_binding(action)
                 dispatched = True
-                if name == "press":
-                    page.keyboard.press(self._norm_key(str(action.args.get("key", ""))))
-                else:
-                    keys = [self._norm_key(k) for k in (action.args.get("keys") or [])]
-                    if keys:
-                        page.keyboard.press("+".join(keys))
-                dispatched = True
+                page.keyboard.press(key)
                 return {"status": "executed", "dispatched": True, "channel": "browser_dom",
                         "resolved": "locator", "action": name,
                         "latency_ms": round((time.perf_counter() - started) * 1000, 2)}

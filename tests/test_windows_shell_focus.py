@@ -163,11 +163,25 @@ def test_start_menu_keyboard_requires_same_live_foreground(shell):
     shell.input.press.assert_not_called()
 
 
+@pytest.mark.parametrize(("keys", "expected"), [
+    (["CTRL", "A"], ("ctrl", "a")),
+    (["cTrL", "sHiFt", "Z"], ("ctrl", "shift", "z")),
+    (["Alt", "F4"], ("alt", "f4")),
+    (["Ctrl", "+"], ("ctrl", "+")),
+])
+def test_desktop_hotkey_dispatch_uses_explicit_modifiers(shell, keys, expected):
+    shell.foreground = shell.app
+    shell.env.observe()
+    result = shell.env.step(Action("hotkey", {"keys": keys}))
+    assert result.info["dispatched"]
+    shell.input.hotkey.assert_called_once_with(*expected)
+
+
 @pytest.mark.parametrize(("host", "key"), [("menu", "win"), ("search", "winleft"), ("search", "winright")])
 def test_win_r_from_start_reports_dispatch_without_visible_run_dialog(shell, host, key):
     shell.foreground = getattr(shell, host)
     shell.env.observe()
-    result = shell.env.step(Action("hotkey", {"keys": [key, "r"]}))
+    result = shell.env.step(Action("hotkey", {"keys": [key.upper(), "R"]}))
     shell.input.hotkey.assert_called_once_with(key, "r")
     assert result.info["dispatched"] and result.info["status"] == "uncertain"
     assert result.info["error_code"] == "run_dialog_not_confirmed"
