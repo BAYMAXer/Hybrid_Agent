@@ -177,12 +177,27 @@ def target_worker(args, workspace):
         result['dispatched'] = True
         if op == 'shell':
             command = args['command']
-            shell = ['cmd.exe', '/d', '/s', '/c', command] if os.name == 'nt' else ['/bin/bash', '-c', command]
+            executable = None
+            if os.name == 'nt':
+                import ctypes
+                system_dir = ctypes.create_unicode_buffer(32768)
+                kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+                kernel32.GetSystemDirectoryW.argtypes = [ctypes.POINTER(ctypes.c_wchar), ctypes.c_uint]
+                kernel32.GetSystemDirectoryW.restype = ctypes.c_uint
+                size = kernel32.GetSystemDirectoryW(system_dir, len(system_dir))
+                if not 0 < size < len(system_dir):
+                    raise OSError('无法定位 Windows 系统命令解释器')
+                executable = os.path.join(system_dir.value, 'cmd.exe')
+                # /s removes just our outer quotes, leaving command's own quotes
+                # intact. Popen(list) would add C-runtime backslash escapes here.
+                shell = f'"{executable}" /d /s /c "{command}"'
+            else:
+                shell = ['/bin/bash', '-c', command]
             result['command'] = command
             # Spool output, never buffer unbounded stdout in RAM or wait on
             # inherited pipes from a child launched by the command.
             with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
-                proc = subprocess.Popen(shell, cwd=str(cwd), stdin=subprocess.DEVNULL,
+                proc = subprocess.Popen(shell, executable=executable, cwd=str(cwd), stdin=subprocess.DEVNULL,
                                         stdout=out, stderr=err, start_new_session=os.name != 'nt',
                                         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0)
                 try:
@@ -349,6 +364,8 @@ def execute_cli(env, args, remaining_s=120, *, file_content=None):
 
 
 def cli_capability(env):
+    import os
+    import sys
     initial = getattr(env, 'initial_state', None) or {}
     workspace = initial.get('workspace_dir') or initial.get('downloads_dir') or getattr(env, 'workspace_dir', None)
     local = getattr(env, 'cli_target', None) == 'local'
@@ -357,8 +374,21 @@ def cli_capability(env):
         workspace = getattr(env, 'guest_workspace_dir', None) or initial.get('target_workspace_dir')
         # Never interpret a controller-side download path as a guest path.
     available = bool(workspace and (local or guest and callable(getattr(getattr(env, 'controller', None), 'run_python_script', None))))
-    return {'available': available, 'target': 'local' if local else 'guest', 'workspace': str(workspace or ''),
-            'os': getattr(env, 'os_name', ''), 'cli_only': bool(getattr(env, 'cli_only', False)), 'reason': '' if available else '目标环境没有可用 CLI 执行器或默认工作目录'}
+    target_os = getattr(env, 'os_name', '')
+    capability = {'available': available, 'target': 'local' if local else 'guest', 'workspace': str(workspace or ''),
+                  'os': target_os, 'cli_only': bool(getattr(env, 'cli_only', False)),
+                  'reason': '' if available else '目标环境没有可用 CLI 执行器或默认工作目录'}
+    if available and local:
+        capability['shell'] = 'cmd.exe' if os.name == 'nt' else '/bin/bash'
+        if sys.executable:
+            capability['python_executable'] = os.path.abspath(sys.executable)
+    elif available and guest:
+        guest_os = str(target_os or '').lower()
+        if guest_os in {'windows', 'win32', 'nt'}:
+            capability['shell'] = 'cmd.exe'
+        elif guest_os in {'linux', 'ubuntu', 'darwin', 'mac', 'macos'}:
+            capability['shell'] = '/bin/bash'
+    return capability
 
 
 def file_check_samples(env, predicates, remaining):
