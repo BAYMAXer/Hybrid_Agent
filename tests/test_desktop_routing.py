@@ -5,6 +5,7 @@ import pytest
 from PIL import Image
 
 from hybrid_agent.actions import Action
+from hybrid_agent.browser.browser_feedback import operational_facts
 from hybrid_agent.decision_context import action_scope, system_sections
 from hybrid_agent.env import Observation
 from hybrid_agent.pipeline import Pipeline
@@ -40,6 +41,18 @@ def test_modes_filter_browser_skills_and_render_scoped_references():
     assert mode_capability(obs).mode == 'gui'
     obs.screenshot = None
     assert mode_capability(obs).mode == 'observe'
+
+
+def test_desktop_feedback_describes_actual_capture_and_available_actions():
+    obs = observation()
+    obs.info.update(desktop_monitor={'id': 'test'}, cli_capability={'available': True})
+    facts = '\n'.join(operational_facts(obs, None, None))
+    assert '固定任务屏' in facts
+    assert not any(term in facts for term in ('observe_browser', '虚拟桌面', 'PDF'))
+    obs.info.update(task_mode='browser')
+    obs.info.pop('desktop_monitor')
+    browser_handoff = '\n'.join(operational_facts(obs, None, None))
+    assert 'observe_browser' in browser_handoff and '虚拟桌面' in browser_handoff
 
 
 def test_small_ax_budget_keeps_matching_edit_value_visible():

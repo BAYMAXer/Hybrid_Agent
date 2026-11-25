@@ -280,7 +280,7 @@ class WindowsEnvironment(Environment):
         """Collect screenshot and AX on one page, with an explicit coordinate space.
 
         Windows 通用桌面使用本轮固定的任务屏。后台浏览器观察通过 CDP 截取页面，
-        不受浏览器窗口遮挡影响；只有显式 observe_desktop 才观察整个虚拟桌面。
+        不受浏览器窗口遮挡影响。浏览器任务显式切到桌面时观察整个虚拟桌面。
         """
         from ..model.grounding import screenshot_size
         from ..runtime.scene import Scene, browser_scene
@@ -907,7 +907,7 @@ class WindowsEnvironment(Environment):
         # 坐标化后执行 pyautogui 命令
         try:
             if sys.platform == 'win32' and not self._desktop_capture and name != 'wait':
-                raise ValueError('缺少有效虚拟桌面截图，请重新 observe_desktop')
+                raise ValueError('缺少有效桌面截图，请重新 observe_desktop')
             if self._desktop_capture:
                 from ..desktop.desktop_capture import validate_desktop_action, virtual_geometry
                 mapped, origin = validate_desktop_action(action, self._desktop_capture, virtual_geometry())

@@ -287,7 +287,13 @@ def operational_facts(obs, completion, report, step=None, *, os_name="", search_
     if info.get('active_surface') == 'desktop':
         from ..desktop.desktop_readiness import foreground, window_ready
         import json
-        lines.append('当前为桌面接管：截图覆盖虚拟桌面，界面输入会使用真实鼠标键盘。返回后台网页操作用 observe_browser。')
+        if info.get('task_mode') == 'desktop':
+            if info.get('desktop_monitor'):
+                lines.append('截图覆盖固定任务屏，鼠标定位以该图左上角为原点。')
+            else:
+                lines.append('当前通过桌面截图操作，鼠标定位以该图左上角为原点。')
+        else:
+            lines.append('当前为桌面接管：截图覆盖虚拟桌面，界面输入会使用真实鼠标键盘。返回后台网页操作用 observe_browser。')
         front = foreground(info.get('runtime_state', {}))
         if front:
             lines.append('系统观察到的前台窗口：' + str(front.get('process_name', ''))[:80] + ' / '
@@ -325,7 +331,7 @@ def operational_facts(obs, completion, report, step=None, *, os_name="", search_
         lines.append('PDF 渲染等待已超时，当前画面尚未确认就绪；请检查页面或切换观察，不要在空白画面反复保存。')
     if not inspecting and not info.get('cli_capability', {}).get('available'):
         lines.extend(rename_ui_guidance(obs, completion, report, os_name))
-    else:
+    elif info.get('task_mode') != 'desktop':
         lines.append('下载文件的存在性、完整性及 PDF 身份由框架直接检查；不要打开文件管理器核查。'
                      '若框架报告文件错误，再通过浏览器重新获取正确 PDF。')
     return list(dict.fromkeys(lines))
