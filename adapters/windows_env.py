@@ -391,7 +391,11 @@ class WindowsEnvironment(Environment):
         if self._task_monitor:
             from ..desktop.monitor_windows import window_fits
             info['desktop_window_moved'] = window_moved
-            if not ax_window or not window_fits(ax_window, self._task_monitor.monitor):
+            selection = self._task_monitor.selection_required(desktop_before or {}, self._desktop_intent_task)
+            if selection:
+                info['desktop_window_selection_required'] = selection
+                ax_window = None
+            elif not ax_window or not window_fits(ax_window, self._task_monitor.monitor):
                 ax_window = None
                 info['desktop_foreground_outside_task_monitor'] = True
         if self.task_mode == "desktop" and self._desktop_ax:
@@ -604,6 +608,8 @@ class WindowsEnvironment(Environment):
                         try:
                             monitor = self._task_monitor.refresh()
                             self._task_monitor.guard_focus(live_state)
+                            if self._task_monitor.selection_required(live_state, self._desktop_intent_task):
+                                return None
                         except MonitorStop as exc:
                             self._stop_monitor(exc)
                             return None
@@ -751,15 +757,23 @@ class WindowsEnvironment(Environment):
                         if self._captured_layouts and "_window_layout" not in current_state:
                             raise OSError("无法核实目标窗口位置")
                         layouts = (*self._captured_layouts, current_state["_window_layout"]) if "_window_layout" in current_state else ()
+                        wheel_handles = None
+                        if name == 'scroll' and self._task_monitor:
+                            wheel_handles = ({w['hwnd'] for w in current_state.get('applications', [])
+                                              if self._task_monitor.owns(w, current_state)}
+                                             if self._task_monitor.root else {current['hwnd']})
                         guard_error = pointer_guard(action, self._desktop_capture.get("screen_origin", [0, 0]), browser_handles,
                                                     layouts, leaving_browser=leaving_browser, shell_handles=shell_handles,
-                                                    monitor=self._desktop_capture.get('desktop_monitor'))
+                                                    monitor=self._desktop_capture.get('desktop_monitor'),
+                                                    wheel_handles=wheel_handles)
                     except OSError:
                         return StepResult(self.observe(), info={"status": "rejected", "dispatched": False,
                                           "error_code": "desktop_pointer_unconfirmed", "channel": "desktop"})
                     if guard_error:
                         return StepResult(self.observe(), info={"status": "rejected", "dispatched": False,
                                           "error_code": guard_error, "channel": "desktop",
+                                          **({"reason":"滚轮当前指向其他窗口，请先定位任务窗口内的可滚动区域"}
+                                             if guard_error == "desktop_scroll_target_unconfirmed" else {}),
                                           **({"reason": "鼠标落点不属于截图中已确认的开始菜单或搜索窗口，请重新观察"}
                                              if guard_error == "desktop_shell_target_changed" else {})})
         if name in {"observe_desktop", "observe_browser"}:
@@ -820,6 +834,16 @@ class WindowsEnvironment(Environment):
 
     def _step_desktop(self, action: Action) -> StepResult:
         name = action.action
+        if self._task_monitor and name in {'press', 'hotkey'}:
+            from ..desktop.monitor_windows import monitor_shortcut
+            chord, error = monitor_shortcut(action)
+            if error:
+                return StepResult(self.observe(), info=dict(status='rejected', dispatched=False, channel='desktop',
+                                  error_code='desktop_monitor_shortcut_rejected', reason=error))
+            if chord:
+                # PyAutoGUI presses keys in order. Always hold Win before the letter.
+                field, value = ('key', chord[0]) if name == 'press' else ('keys', list(chord))
+                action = Action(name, {**action.args, field: value})
         if name == 'switch_applications':
             from ..desktop.desktop_state import switch_windows_application, windows_application_process
             if self._task_monitor:
@@ -936,30 +960,32 @@ class WindowsEnvironment(Environment):
             "error": "unsupported action or invalid coordinates"})
 
     def _prepare_monitor_input(self, action, origin):
-        from ..desktop.desktop_readiness import foreground, window_identity, global_shortcut, launch_target
+        from ..desktop.desktop_readiness import foreground, window_identity
         from ..desktop.desktop_state import point_window
-        from ..desktop.monitor_windows import window_fits
+        from ..desktop.monitor_windows import window_fits, monitor_shortcut
         scope = self._task_monitor
         monitor = scope.refresh()
         if self._desktop_capture.get('desktop_monitor', monitor) != monitor:
             return '任务屏幕的尺寸或 DPI 已变化，请重新观察'
         current_state = self._runtime_state()
         scope.guard_focus(current_state)
+        selection = scope.selection_required(current_state, self._desktop_intent_task)
+        if selection:
+            return '请先使用 switch_applications 的 window_title 选择已确认的任务文档：' + '、'.join(selection)
         current = foreground(current_state)
         previous = foreground(self._last_observation_info.get('runtime_state', {}))
         if (not current or window_identity(current) != window_identity(previous)
                 or current.get('bounds') != previous.get('bounds') or current.get('title') != previous.get('title')):
             return '前台窗口已变化，请重新观察后再操作'
-        if global_shortcut(action):
-            keys = {str(k).lower() for k in action.args.get('keys') or [action.args.get('key')]}
-            keys = {'win' if k in {'winleft', 'winright'} else k for k in keys}
-            if keys in ({'alt','tab'}, {'alt','shift','tab'}) or 'win' in keys and keys & {'left','right'}:
-                return '固定屏幕任务请按名称切换目标窗口，不能使用跨屏或盲切窗口的快捷键'
-            if not launch_target(action) and not window_fits(current, monitor):
+        chord, error = monitor_shortcut(action)
+        if error:
+            return error
+        if chord:
+            if chord != ('win', 'e') and not window_fits(current, monitor):
                 return '当前前台在任务屏外，请先通过 switch_applications 确认目标窗口'
-            if launch_target(action):
+            if chord == ('win', 'e'):
                 scope.launch_baseline = {window_identity(w) for w in current_state.get('applications', [])}
-            scope.shell_transition = keys in ({'win'}, {'win','r'}, {'win','s'})
+            scope.shell_transition = chord != ('win', 'e')
             return ''
         target = current
         point = ('x1','y1') if action.action == 'drag_and_drop' else ('x','y')
@@ -968,6 +994,13 @@ class WindowsEnvironment(Environment):
             match = next((w for w in current_state['applications'] if w.get('hwnd') == hit), None)
             if match:
                 target = match
+                if scope.root and not scope.owns(match, current_state):
+                    from ..desktop.monitor_windows import task_named_windows
+                    same_app = [w for w in current_state['applications']
+                                if w.get('process_name') == match.get('process_name')]
+                    named = task_named_windows(same_app, self._desktop_intent_task)
+                    if named and match not in named:
+                        return '点选窗口与任务指定的文档不符，请按已确认的窗口标题定位'
         in_shell = (target.get('shell_surface') or target.get('class_name') in
                     {'Shell_TrayWnd','Shell_SecondaryTrayWnd','Progman','WorkerW'}
                     or target.get('class_name') == '#32770' and target.get('process_name', '').lower() == 'explorer.exe')

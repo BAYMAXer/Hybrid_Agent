@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import ntpath
 import re
 from ctypes import wintypes
 
@@ -29,11 +30,12 @@ def document_title(title):
     return re.split(r'\s+[–—-]\s+', str(title).strip().lstrip('*'), maxsplit=1)[0].strip().casefold()
 
 
-def task_named_windows(candidates, task):
+def _task_documents(candidates, task):
     # A process name or a generic application caption does not identify a document.
     text = str(task or '').casefold()
-    found = []
     for window in candidates:
+        if window.get('cloaked') or window.get('class_name') == '#32770':
+            continue
         name = document_title(window.get('title', ''))
         if not name:
             continue
@@ -45,9 +47,40 @@ def task_named_windows(candidates, task):
             if not suffix:
                 continue
             pattern += r'\.(?:' + suffix + ')'
-        if re.search(r'(?<![\w.\-])' + pattern + r'(?![a-z0-9_.\-])', text, re.ASCII):
-            found.append(window)
-    return found
+        match = re.search(r'(?<![\w.\-])' + pattern + r'(?![a-z0-9_.\-])', text, re.ASCII)
+        if match and not re.search(r'(?:创建|新建|另存为|\bcreate\b|\bsave as\b)[^，。；;\n]{0,64}$',
+                                   text[:match.start()]):
+            yield ntpath.basename(match[0]), window
+
+
+def task_named_windows(candidates, task):
+    return [window for _, window in _task_documents(candidates, task)]
+
+
+def monitor_shortcut(action):
+    """Classify session-wide shortcuts, including sided Win32 modifier aliases."""
+    if action.action not in ('press', 'hotkey'):
+        return (), ''
+    raw = [action.args.get('key')] if action.action == 'press' else action.args.get('keys')
+    if not isinstance(raw, (tuple, list)) or not all(isinstance(k, str) for k in raw):
+        return (), '快捷键需要有效的按键名称'
+    aliases = {'winleft':'win', 'winright':'win', 'windows':'win', 'meta':'win', 'super':'win',
+               'altleft':'alt', 'altright':'alt', 'ctrlleft':'ctrl', 'ctrlright':'ctrl', 'control':'ctrl',
+               'shiftleft':'shift', 'shiftright':'shift', 'escape':'esc', 'del':'delete'}
+    names = [k.strip().casefold() for k in raw]
+    if any(len(k) > 1 and '+' in k for k in names):
+        return (), '请用 hotkey 的 keys 列表分别提供快捷键的每个键'
+    keys = {aliases.get(k, k) for k in names}
+    if 'win' in keys and len(keys) == len(names):
+        other = keys - {'win'}
+        if not other or other in ({'e'}, {'r'}, {'s'}):
+            return ('win', *other), ''
+    if ('win' in keys or 'alt' in keys and keys & {'tab','esc','f6'}
+            or 'ctrl' in keys and 'esc' in keys
+            or {'ctrl','alt','delete'} <= keys
+            or keys & {'launchapp1','launchapp2','launchmail','launchmediaselect','browserhome','sleep'}):
+        return (), '固定屏幕仅支持 Win、Win+E、Win+R、Win+S 系统快捷键；请用 switch_applications 按名称切换窗口，避免盲切'
+    return (), ''
 
 
 def _move_to_work_area(window, monitor):
@@ -179,6 +212,20 @@ class TaskMonitor:
         if self.root and not self.owns(current, state) and not self.shell_window(current):
             raise MonitorStop('desktop_window_focus_changed', '前台已切换至未确认的任务窗口，已停止桌面输入')
 
+    def selection_required(self, state, task):
+        if self.root:
+            return []
+        documents = list(_task_documents(state.get('applications', []), task))
+        seen = set()
+        for name, _window in documents:
+            if name in seen:
+                raise MonitorStop('desktop_window_ambiguous', f'有多个窗口显示任务文档 {name}，无法核对具体目标')
+            seen.add(name)
+        current = window_identity(foreground(state))
+        if not any(window_identity(w) == current for _, w in documents):
+            return [w['title'] for _, w in documents]
+        return []
+
     def shell_window(self, window):
         return bool(window and self.shell_transition and (window.get('shell_surface')
                     or window.get('class_name') == '#32770' and window.get('process_name', '').casefold() == 'explorer.exe'))
@@ -186,6 +233,8 @@ class TaskMonitor:
     def prepare_observation(self, state, task):
         """Only an explicit target/owner relationship grants off-screen relocation."""
         monitor = self.refresh()
+        if self.selection_required(state, task):
+            return
         win = foreground(state)
         if not win:
             return
@@ -207,6 +256,6 @@ class TaskMonitor:
                 raise MonitorStop('desktop_window_outside_monitor', '启动器或系统弹窗位于任务屏外，已停止输入')
         elif self.root:
             self.guard_focus(state)
-        elif (matches := task_named_windows(state.get('applications', []), task)) and len(matches) == 1:
-            if window_identity(matches[0]) == ident:
+        elif matches := task_named_windows(state.get('applications', []), task):
+            if any(window_identity(w) == ident for w in matches):
                 self.bind(win)

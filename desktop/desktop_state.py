@@ -180,7 +180,7 @@ def point_window(x, y):
 
 
 def pointer_guard(action, origin, browser_handles, layouts, *, leaving_browser=False, shell_handles=None,
-                  monitor=None):
+                  monitor=None, wheel_handles=None):
     """Recheck local window geometry at the gesture points, including background windows."""
     if sys.platform != 'win32':
         return ""
@@ -209,6 +209,8 @@ def pointer_guard(action, origin, browser_handles, layouts, *, leaving_browser=F
                                 and monitor['top'] <= p.y < monitor['top'] + monitor['height']):
                 return "desktop_pointer_outside_monitor"
             owner = user.GetAncestor(user.WindowFromPoint(p), 2)
+            if action.action == 'scroll' and wheel_handles is not None and owner not in wheel_handles:
+                return "desktop_scroll_target_unconfirmed"
             if owner in browser_handles or (leaving_browser and not owner):
                 return "browser_task_out_of_scope"
             if shell_handles is not None and owner not in shell_handles:
@@ -317,12 +319,16 @@ def switch_windows_application(app_code, *, window_title='', task='', bind=None)
         matches = [a for a in matches if a.get('class_name') in {'CabinetWClass', 'ExploreWClass'}]
     if bind:
         from .monitor_windows import document_title, task_named_windows
+        named = task_named_windows(matches, task)
         if window_title:
             title = window_title.strip().casefold()
             exact = [w for w in matches if title in (w['title'].casefold(), document_title(w['title']))]
             matches = exact or task_named_windows(matches, title)
+            if named and matches and any(w not in named for w in matches):
+                return {**result, 'status':'rejected', 'error_code':'desktop_window_title_conflict',
+                        'reason':'所选窗口与任务明确指定的文档不符，请使用已核对的文档标题',
+                        'candidates':[w['title'] for w in named[:8]]}
         else:
-            named = task_named_windows(matches, task)
             if named:
                 matches = named
         if len(matches) == 1:

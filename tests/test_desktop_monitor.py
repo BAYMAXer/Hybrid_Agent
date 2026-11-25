@@ -65,6 +65,9 @@ def test_target_doc_reused_process_and_late_owned_dialog_only(screens, monkeypat
     monkeypatch.setattr(desktop_state, 'windows_runtime_state', lambda **_: state)
     monkeypatch.setattr(desktop_state, '_activate_window', lambda hwnd: (True, True))
     scope = TaskMonitor('primary')
+    rejected = desktop_state.switch_windows_application('word', window_title='预算.docx',
+                                                         task='请处理报告.docx并保存', bind=scope.bind)
+    assert rejected['error_code'] == 'desktop_window_title_conflict' and not moved and scope.root is None
     result = desktop_state.switch_windows_application('word', task='请处理报告.docx并保存', bind=scope.bind)
     assert result['window']['hwnd'] == 2 and moved == [2]
     first['foreground'] = False
@@ -150,3 +153,89 @@ def test_stale_global_shortcut_rejected_and_no_cross_monitor_blind_switch(screen
     assert '盲切' in env._prepare_monitor_input(Action('hotkey', {'keys':['alt','tab']}), (0,0))
     screens[0]['dpi'] = [144,144]
     assert 'DPI' in env._prepare_monitor_input(Action('hotkey', {'keys':['win','e']}), (0,0))
+
+
+@pytest.mark.parametrize('action,args', [
+    ('hotkey', {'keys':['Win','D']}), ('hotkey', {'keys':['M','WinRight']}),
+    ('hotkey', {'keys':['WinLeft','2']}), ('hotkey', {'keys':['shift','WIN','LEFT']}),
+    ('hotkey', {'keys':['AltLeft','TAB']}), ('hotkey', {'keys':['ShiftRight','tab','AltRight']}),
+    ('hotkey', {'keys':['Escape','ShiftLeft','CtrlRight']}), ('hotkey', {'keys':['CTRL','ALT','DELETE']}),
+    ('press', {'key':'Win+D'}), ('press', {'key':['Win','D']}),
+])
+def test_untracked_global_shortcuts_never_reach_dispatch(screens, monkeypatch, action, args):
+    env = WindowsEnvironment(task_mode='desktop')
+    env._task_monitor = TaskMonitor('primary')
+    monkeypatch.setattr(env, 'observe', Mock())
+    result = env._step_desktop(Action(action, args))
+    assert result.info['error_code'] == 'desktop_monitor_shortcut_rejected' and not result.info['dispatched']
+
+
+@pytest.mark.parametrize('action,args,chord', [
+    ('press', {'key':'WinLeft'}, ('win',)), ('hotkey', {'keys':['WinRight']}, ('win',)),
+    ('hotkey', {'keys':['E','WINRIGHT']}, ('win','e')), ('hotkey', {'keys':['R','WIN']}, ('win','r')),
+    ('hotkey', {'keys':['WINLEFT','s']}, ('win','s')), ('hotkey', {'keys':['CTRL','L']}, ()),
+])
+def test_tracked_shortcuts_use_modifier_first_and_leave_local_chords_intact(action, args, chord):
+    assert monitor_windows.monitor_shortcut(Action(action,args)) == (chord, '')
+
+
+def test_initial_duplicate_document_stops_before_capture_or_input(screens, monkeypatch):
+    env = WindowsEnvironment(task_mode='desktop')
+    env._task_monitor = TaskMonitor('primary')
+    env._desktop_intent_task = '在 Word 编辑 report.docx'
+    windows = [win(51,'report - Word',[10,20,680,550]), win(99,'report.docx - Word',[-1400,30,-600,800],active=False)]
+    monkeypatch.setattr(env, '_runtime_state', lambda: {'applications': windows})
+    monkeypatch.setattr(env, '_desktop_is_input', lambda: True)
+    monkeypatch.setattr(env, '_take_screenshot', lambda: pytest.fail('unconfirmed selection was observed'))
+    assert env.observe().info['desktop_stop']['error_code'] == 'desktop_window_ambiguous'
+    assert not env._task_monitor.root
+
+
+def test_offscreen_named_document_blocks_unrelated_initial_gui_and_ax(screens, monkeypatch):
+    env = WindowsEnvironment(task_mode='desktop')
+    env._task_monitor = TaskMonitor('primary')
+    env._desktop_intent_task = '打开并编辑报告.docx'
+    current = win(51, '预算.docx - Word', [10,20,680,550])
+    target = win(99, '报告 - Word', [-1400,30,-600,800], active=False)
+    state = {'applications':[current,target]}
+    monkeypatch.setattr(env, '_runtime_state', lambda: deepcopy(state))
+    monkeypatch.setattr(env, '_desktop_is_input', lambda: True)
+    monkeypatch.setattr(env, '_take_screenshot', lambda: Image.new('RGB',(1920,1080)))
+    env._desktop_ax = Mock()
+    env._desktop_ax.observe.return_value = None, 'unavailable'
+    obs = env.observe()
+    assert obs.info['desktop_window_selection_required'] == [target['title']]
+    env._desktop_ax.observe.assert_called_once_with(None,None)
+    error = env._prepare_monitor_input(Action('type',{'text':'private'}),(0,0))
+    assert 'switch_applications' in error and env._task_monitor.root is None
+    # Multiple distinct task documents are selectable individually.
+    assert not env._task_monitor.selection_required(state, '从预算.docx复制内容到报告.docx')
+
+
+def test_scroll_rejects_another_window_under_cursor_on_same_monitor(screens, monkeypatch):
+    import ctypes
+    from types import SimpleNamespace
+    from contextlib import nullcontext
+    env = WindowsEnvironment(task_mode='desktop')
+    env._task_monitor = TaskMonitor('primary')
+    current = win(51,'task',[20,20,620,500])
+    other = win(55,'personal',[640,20,1040,500],active=False)
+    env._task_monitor.bind(current)
+    state = {'applications':[current,other]}
+    env._last_observation_info = {'runtime_state':state,'desktop_focus_stable':True}
+    env._desktop_capture = {'desktop_monitor':screens[0],'screen_origin':[0,0]}
+    monkeypatch.setattr(env, '_desktop_is_input', lambda: True)
+    monkeypatch.setattr(env, '_runtime_state', lambda: state)
+    monkeypatch.setattr(env, 'observe', Mock())
+    monkeypatch.setattr(desktop_state, 'sys', SimpleNamespace(platform='win32'))
+    monkeypatch.setattr(capture,'physical_dpi_context',nullcontext)
+    user = Mock()
+    def cursor(ptr):
+        ptr._obj.x, ptr._obj.y = 650,100
+        return True
+    user.GetCursorPos.side_effect = cursor
+    user.WindowFromPoint.return_value = 1001
+    user.GetAncestor.return_value = 55
+    monkeypatch.setattr(ctypes,'WinDLL',lambda *args,**kw:user,raising=False)
+    outcome = env._step(Action('scroll',{'direction':'down','amount':2}))
+    assert not outcome.info['dispatched'] and outcome.info['error_code'] == 'desktop_scroll_target_unconfirmed'
