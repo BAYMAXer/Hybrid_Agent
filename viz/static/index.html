@@ -512,6 +512,11 @@
               <label class="checkbox-row" title="勾选后保留任务浏览器的 Cookie 和站点存储；取消后每次使用临时隔离会话。"><input id="local-browser-session" type="checkbox" checked aria-describedby="local-browser-session-status">保留任务浏览器登录状态</label>
               <label class="field-label" for="local-task-mode">任务场景</label>
               <select id="local-task-mode"><option value="">本机默认</option><option value="desktop">Windows 通用桌面</option><option value="browser">浏览器</option><option value="cli">后台文件与终端</option></select>
+              <div id="local-monitor-field" hidden>
+                <label class="field-label" for="local-desktop-monitor">任务屏幕</label>
+                <select id="local-desktop-monitor"><option value="primary">Windows 主屏</option></select>
+                <span class="field-tip" id="local-monitor-status" role="status" hidden></span>
+              </div>
               <label class="checkbox-row"><input id="local-terra" type="checkbox" disabled>使用已授权的 GPT-6.1 Terra 执行决策、定位和核查</label>
               <label class="checkbox-row"><input id="local-visual-only" type="checkbox">纯视觉桌面验证（关闭 AX 和 OCR 回退）</label>
               <input id="local-browser-profile" type="hidden">
@@ -2182,6 +2187,8 @@ document.getElementById('local-workspace-choose').addEventListener('click', asyn
 const localTaskMode = document.getElementById('local-task-mode');
 const visualOnly = document.getElementById('local-visual-only');
 const localTerra = document.getElementById('local-terra');
+const monitorField = document.getElementById('local-monitor-field');
+const monitorSelect = document.getElementById('local-desktop-monitor');
 let executorPlatform = '';
 function localModelPreferenceKey() {
   const mode = localTaskMode.value || (executorPlatform === 'win32' ? 'desktop' : 'default');
@@ -2196,20 +2203,40 @@ function updateLocalModelPreference() {
 }
 const executorReady = fetch('/runtime/info').then(r => r.json()).then(info => {
   executorPlatform = info.platform || '';
+  const monitors = info.desktop_monitors || [];
+  if (monitors.length) {
+    monitorSelect.replaceChildren();
+    for (const m of monitors) {
+      const device = m.name && m.name !== m.id ? m.name + ' (' + m.id + ')' : m.id;
+      const label = device + ' · ' + m.width + ' × ' + m.height + (m.primary ? '（主屏）' : '');
+      monitorSelect.add(new Option(label, m.primary ? 'primary' : m.id, m.primary, m.primary));
+    }
+  }
+  if (info.desktop_monitors_error) {
+    const status = document.getElementById('local-monitor-status');
+    status.textContent = '读取显示器失败：' + info.desktop_monitors_error;
+    status.hidden = false;
+  }
 }).catch(() => {}).finally(() => {
+  updateMonitorField();
   updateLocalModelPreference();
   localTerra.disabled = false;
 });
+function updateMonitorField() {
+  monitorField.hidden = executorPlatform !== 'win32' || !['', 'desktop'].includes(localTaskMode.value);
+}
 localTerra.addEventListener('change', () => {
   try { localStorage.setItem(localModelPreferenceKey(), String(localTerra.checked)); } catch {}
 });
 localTaskMode.addEventListener('change', () => {
   visualOnly.disabled = !['', 'desktop'].includes(localTaskMode.value);
   if (visualOnly.disabled) visualOnly.checked = false;
+  updateMonitorField();
   updateLocalModelPreference();
 });
 function localTaskOptions() {
   return {task_mode: localTaskMode.value || (visualOnly.checked ? 'desktop' : ''),
+    ...(!monitorField.hidden ? {desktop_monitor: monitorSelect.value} : {}),
     verification_backend: document.getElementById('local-terra').checked ? 'terra' : 'configured',
     disable_desktop_ax: visualOnly.checked, disable_ocr_grounding: visualOnly.checked};
 }

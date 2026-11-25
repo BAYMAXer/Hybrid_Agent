@@ -48,6 +48,9 @@ class StudioLiveUITests(unittest.TestCase):
         self.addCleanup(server.terminate)
         workspace = self.enterContext(tempfile.TemporaryDirectory())
         page.route("**/workspace/default", lambda route: route.fulfill(json={"ok": True, "workspace_dir": workspace}))
+        page.route("**/runtime/info", lambda route: route.fulfill(json={"platform": "win32", "desktop_monitors": [
+            {"id": "DISPLAY-A", "name": "Office", "width": 2560, "height": 1440, "primary": True},
+            {"id": "DISPLAY-B", "name": "Office", "width": 1920, "height": 1080, "primary": False}]}))
 
         pending = []
         task = "Read the Calculator display"
@@ -82,13 +85,19 @@ class StudioLiveUITests(unittest.TestCase):
         execute("old", 7, "previous-target")
         expect(action).to_contain_text("previous-target")
         page.locator("#nav-run").click()
+        monitor = page.locator("#local-desktop-monitor")
+        expect(monitor).to_have_value("primary")
+        expect(monitor).to_contain_text("2560 × 1440（主屏）")
+        page.locator("#local-task-mode").select_option("cli")
+        expect(monitor).to_be_hidden()
         page.locator("#local-task-mode").select_option("desktop")
+        monitor.select_option("DISPLAY-B")
         page.locator("#local-task").fill(task)
         with page.expect_request("**/run/start") as submitted:
             page.locator("#btn-local-start").click()
         request = submitted.value.post_data_json
-        self.assertEqual((request["task"], request["task_mode"], request["workspace_dir"]),
-                         (task, "desktop", workspace))
+        self.assertEqual((request["task"], request["task_mode"], request["workspace_dir"], request["desktop_monitor"]),
+                         (task, "desktop", workspace, "DISPLAY-B"))
 
         # Deliver the first observation while the start response is still pending.
         running.update(status="running", run_id="current", task=task)

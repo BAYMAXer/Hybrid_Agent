@@ -11,7 +11,7 @@ from hybrid_agent.desktop.hcu_ax import DesktopAX, browser_window
 from hybrid_agent.pipeline import Pipeline
 
 
-WINDOW = {"title": "Example", "hwnd": 21, "pid": 98, "process_name": "Notepad.exe",
+WINDOW = {"title": "Example", "hwnd": 21, "pid": 98, "process_name": "Notepad.exe", "bounds": [0, 0, 180, 120],
           "class_name": "Notepad", "foreground": True, "visible": True}
 
 
@@ -51,6 +51,9 @@ class Provider:
 def desktop(tmp_path, monkeypatch):
     lease_key = 'test-' + uuid4().hex
     monkeypatch.setattr('hybrid_agent.desktop.desktop_capture.windows_desktop_key', lambda: lease_key)
+    monitor = dict(id='test-monitor', name='test', left=0, top=0, width=180, height=120,
+                   work_area=[0, 0, 180, 120], dpi=[96, 96], primary=True)
+    monkeypatch.setattr('hybrid_agent.desktop.desktop_capture.list_desktop_monitors', lambda: [monitor])
     state = {"applications": [dict(WINDOW)]}
     env = WindowsEnvironment(task_mode="desktop", workspace_dir=str(tmp_path))
     monkeypatch.setattr(env, "_desktop_is_input", lambda: True)

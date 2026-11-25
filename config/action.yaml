@@ -87,7 +87,7 @@ actions:
 
   switch_applications:
     params: [app_code]
-    description: "激活已打开的目标应用窗口；Windows 支持 app_code=file_explorer/chrome 或进程名。未打开时请用系统启动器或快捷键；不支持精确切换的环境会明确拒绝"
+    description: "激活已打开的目标应用窗口。Windows 接受 app_code 和可选 window_title（精确窗口标题或文档名），用于区分同一进程中的多个窗口。"
     kind: env
     resolve: none
 

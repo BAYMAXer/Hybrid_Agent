@@ -115,6 +115,69 @@ def virtual_geometry():
     return {'left': left, 'top': top, 'width': width, 'height': height}
 
 
+def list_desktop_monitors():
+    """Enumerate physical display rectangles in the same DPI context as capture and input."""
+    if sys.platform != 'win32':
+        return []
+    import ctypes
+    from ctypes import wintypes as w
+    class MonitorInfo(ctypes.Structure):
+        _fields_ = [('size', w.DWORD), ('rect', w.RECT), ('work', w.RECT),
+                    ('flags', w.DWORD), ('device', w.WCHAR * 32)]
+
+    user = ctypes.WinDLL('user32', use_last_error=True)
+    shcore = ctypes.WinDLL('shcore', use_last_error=True)
+    callback = ctypes.WINFUNCTYPE(w.BOOL, w.HANDLE, w.HDC, ctypes.POINTER(w.RECT), w.LPARAM)
+    user.EnumDisplayMonitors.argtypes = [w.HDC, ctypes.POINTER(w.RECT), callback, w.LPARAM]
+    user.GetMonitorInfoW.argtypes = [w.HANDLE, ctypes.POINTER(MonitorInfo)]
+    shcore.GetDpiForMonitor.argtypes = [w.HANDLE, ctypes.c_int, ctypes.POINTER(w.UINT), ctypes.POINTER(w.UINT)]
+    monitors = []
+
+    @callback
+    def collect(handle, _dc, _rect, _data):
+        info = MonitorInfo()
+        info.size = ctypes.sizeof(info)
+        if not user.GetMonitorInfoW(handle, ctypes.byref(info)):
+            return False
+        x, y = w.UINT(), w.UINT()
+        if shcore.GetDpiForMonitor(handle, 0, ctypes.byref(x), ctypes.byref(y)) != 0:
+            return False
+        r, work = info.rect, info.work
+        monitors.append(dict(id=info.device, name=info.device, primary=bool(info.flags & 1),
+                             left=r.left, top=r.top, width=r.right-r.left, height=r.bottom-r.top,
+                             work_area=[work.left, work.top, work.right, work.bottom], dpi=[x.value, y.value]))
+        return True
+
+    with physical_dpi_context():
+        if not user.EnumDisplayMonitors(None, None, collect, 0) or not monitors:
+            raise OSError('无法枚举 Windows 显示器')
+    return sorted(monitors, key=lambda m: (not m['primary'], m['id']))
+
+
+def resolve_desktop_monitor(selector='primary'):
+    if not isinstance(selector, str) or not selector.strip():
+        raise ValueError('需要 Windows 显示器设备标识或 primary')
+    selector = selector.casefold()
+    for monitor in list_desktop_monitors():
+        if (selector == 'primary' and monitor['primary']) or selector == monitor['id'].casefold():
+            return monitor
+    raise ValueError(f'任务显示器不可用：{selector}')
+
+
+def capture_monitor(device):
+    from PIL import ImageGrab
+    with physical_dpi_context():
+        monitor = resolve_desktop_monitor(device)
+        virtual = virtual_geometry()
+        x, y, w, h = (monitor[k] for k in ('left', 'top', 'width', 'height'))
+        image = ImageGrab.grab(bbox=(x, y, x+w, y+h), all_screens=True)
+        if image.size != (w, h) or monitor != resolve_desktop_monitor(device) or virtual != virtual_geometry():
+            raise OSError('截图期间显示器布局发生变化，请重新观察')
+    return image, dict(screen_origin=[x, y], virtual_desktop=virtual, desktop_monitor=monitor,
+                       desktop_capture_id=uuid.uuid4().hex, captured_at=time.time(),
+                       desktop_capture_source='win32_task_monitor', screenshot_size=[w, h])
+
+
 def capture_virtual_desktop():
     from PIL import ImageGrab
     with physical_dpi_context():
@@ -134,6 +197,10 @@ def validate_desktop_action(action, captured, current_geometry):
     geometry = captured.get('virtual_desktop')
     if not geometry or geometry != current_geometry:
         raise ValueError('显示器布局已改变或缺少桌面截图，请重新 observe_desktop')
+    if captured.get('desktop_monitor'):
+        geometry = captured['desktop_monitor']
+        if geometry != resolve_desktop_monitor(geometry['id']):
+            raise ValueError('任务显示器的布局或 DPI 已改变，请重新观察')
     attached = action.args.get('observation_metadata') or {}
     if attached and attached.get('desktop_capture_id') != captured.get('desktop_capture_id'):
         raise ValueError('动作来自过期桌面截图，请重新定位')
@@ -145,5 +212,5 @@ def validate_desktop_action(action, captured, current_geometry):
         for field, limit in ((x, geometry['width']), (y, geometry['height'])):
             value = action.args.get(field)
             if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value < limit:
-                raise ValueError('定位点超出当前虚拟桌面截图范围')
+                raise ValueError('定位点超出当前桌面截图范围')
     return Action(action.action, copy.deepcopy(action.args)), (geometry['left'], geometry['top'])

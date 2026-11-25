@@ -7,6 +7,7 @@ Select --verification-backend terra to exercise all three roles through Codex.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -205,6 +206,29 @@ def _lifecycle_status(payload):
         pass
 
 
+def _record_unavailable_monitor(args, filename, manifest, error):
+    """Preserve an unstarted desktop task, including an unplugged batch display."""
+    import uuid
+    from .runtime.pipeline_types import AgentResult
+    from .training.training_events import TrainingEventWriter
+    from .trajectory import build_trajectory, dump_trajectory
+
+    run_id = os.environ.get('AGENTS_VIZ_RUN_ID') or uuid.uuid4().hex
+    manifest['run_id'] = run_id
+    message = f"无法绑定任务屏幕 {manifest['desktop_monitor']}：{error}"
+    result = AgentResult(task=args.task, run_manifest=manifest, run_id=run_id,
+                         termination_reason='desktop_monitor_unavailable', final_answer=message)
+    directory = Path(args.result_dir)
+    with TrainingEventWriter(directory / filename('events.jsonl'), run_id, manifest) as writer:
+        record = writer.emit('episode_error', error_type=message, reason=result.termination_reason)
+        result.events = writer.events
+        trajectory = build_trajectory(args.task_id, 'windows', args.task, result)
+        dump_trajectory(str(directory / filename('trajectory.json')), trajectory)
+    _lifecycle_status({'event': 'workbench_record', 'run_id': run_id, 'record': record})
+    flush_logs(timeout=1.0)
+    print('DesktopMonitorError: ' + message, file=sys.stderr)
+
+
 def ensure_chrome(port: int, chrome_path: str, *, pdf_downloads=False):
     """确保可连接无痕 Chrome，返回 (是否新建, 本次专用 profile 目录)。"""
     from .browser.utils import cdp_pages_are_incognito, list_cdp_pages
@@ -310,6 +334,8 @@ def main(platform: str = 'windows') -> int:
     parser.add_argument("--cli-only", action="store_true", help="只使用后台文件和终端，不启动浏览器或桌面输入")
     parser.add_argument("--task-mode", choices=["desktop", "browser", "cli"],
                         help="Windows 默认使用原生桌面；browser 显式启动 CDP，cli 只使用后台操作")
+    parser.add_argument("--desktop-monitor", metavar="primary|DEVICE",
+                        help="Windows 桌面任务屏幕，默认 primary。设备标识见 Studio /runtime/info 的 desktop_monitors")
     parser.add_argument("--verification-backend", choices=["configured", "terra"], default="configured",
                         help="terra 通过已登录的 Codex app-server 调用 GPT-6.1 Terra 验证三个模型角色")
     parser.add_argument("--disable-desktop-ax", action="store_true", help="禁用原生 AX，验证纯视觉路径")
@@ -340,8 +366,8 @@ def main(platform: str = 'windows') -> int:
     parser.add_argument("--download-max-mib", type=int, default=50, help="单个下载的资源上限（MiB），0 表示不限大小；不用于论文身份判断")
     parser.add_argument("--task-timeout", type=float, default=1800, help="任务总时间预算（秒）")
     parser.add_argument("--window-timeout", type=float, default=15, help="桌面目标窗口就绪等待上限（秒），轮询不消耗决策步数")
-    parser.add_argument("--width", type=int, default=None, help="屏幕宽（缺省自动检测）")
-    parser.add_argument("--height", type=int, default=None, help="屏幕高（缺省自动检测）")
+    parser.add_argument("--width", type=int, default=None, help="屏幕宽，缺省自动检测；Windows 固定任务屏使用其物理宽度")
+    parser.add_argument("--height", type=int, default=None, help="屏幕高，缺省自动检测；Windows 固定任务屏使用其物理高度")
     parser.add_argument("--browser-port", type=int, default=9222)
     parser.add_argument("--browser-session-mode", choices=['isolated', 'persistent'], default='persistent',
                         help="persistent 保留固定任务配置的持久 Cookie 和站点存储；isolated 每次使用独立临时会话")
@@ -364,6 +390,7 @@ def main(platform: str = 'windows') -> int:
     parser.add_argument("--task-id", help="数据集任务标识；缺省按任务文本生成")
     parser.add_argument('--mode-prompts-file', help='Studio 保存的各模式决策提示词 JSON')
     args = parser.parse_args()
+    args.task_id = args.task_id or "local-" + hashlib.sha256(args.task.encode()).hexdigest()[:16]
     if args.cli_only and args.task_mode not in {None, 'cli'}:
         parser.error("--cli-only 与所选 --task-mode 冲突")
     args.task_mode = args.task_mode or ('cli' if args.cli_only else
@@ -373,6 +400,8 @@ def main(platform: str = 'windows') -> int:
         parser.error(f'不支持的本机平台或任务模式: {platform}/{args.task_mode}')
     if args.task_mode == 'desktop' and platform != 'windows':
         parser.error("通用桌面任务模式目前需要 Windows")
+    if args.desktop_monitor is not None and (args.task_mode != 'desktop' or not args.desktop_monitor.strip()):
+        parser.error('--desktop-monitor 仅适用于 Windows 通用桌面，请指定 primary 或设备标识')
     if args.verification_backend == 'terra' and args.capture_rollout:
         parser.error("Terra 验证后端不提供 rollout token 概率")
     if platform == 'mac' or args.cli_only:
@@ -406,15 +435,26 @@ def main(platform: str = 'windows') -> int:
             is_paper_download=task_profile(args.task, task_completion.public_spec)['kind'] == 'paper_download',
             browser_start_url=args.browser_start_url)
 
-    # 0) 屏幕分辨率：grounding 按它换算坐标，必须和真实屏幕一致
-    if args.cli_only:
-        sw, sh = 1280, 800  # unused: no screenshots/grounding in CLI-only mode
+    run_manifest = {'task_mode': args.task_mode, 'verification_backend': args.verification_backend}
+    if args.task_mode == 'desktop':
+        from .desktop.desktop_capture import resolve_desktop_monitor
+        run_manifest['desktop_monitor'] = args.desktop_monitor or 'primary'
+        try:
+            monitor = resolve_desktop_monitor(run_manifest['desktop_monitor'])
+        except (ValueError, OSError) as exc:
+            _record_unavailable_monitor(args, log_name, run_manifest, exc)
+            return 1
+        run_manifest.update(desktop_monitor=monitor['id'], desktop_monitor_info=monitor)
+        width, height = monitor['width'], monitor['height']
+        print(f"[screen] 任务屏幕 {monitor['id']}，物理分辨率 {width}x{height}")
     else:
-        import pyautogui
-        sw, sh = pyautogui.size()
-    width = args.width or sw
-    height = args.height or sh
-    print(f"[screen] 分辨率 {width}x{height}（检测到 {sw}x{sh}）")
+        if args.cli_only:
+            sw, sh = 1280, 800  # unused: no screenshots/grounding in CLI-only mode
+        else:
+            import pyautogui
+            sw, sh = pyautogui.size()
+        width, height = args.width or sw, args.height or sh
+        print(f"[screen] 分辨率 {width}x{height}（检测到 {sw}x{sh}）")
 
     startup_started = time.perf_counter()
     startup_phase = args.task_mode + '_startup'
@@ -504,6 +544,8 @@ def main(platform: str = 'windows') -> int:
                       'browser_session_mode': args.browser_session_mode}
         if platform == 'windows' and not args.cli_only:
             env_kwargs.update(task_mode=args.task_mode, enable_desktop_ax=not args.disable_desktop_ax)
+        if args.task_mode == 'desktop':
+            env_kwargs['desktop_monitor'] = run_manifest['desktop_monitor']
         env = LocalEnvironment(**env_kwargs)
 
         log_status({"event": "phase_timing", "phase": startup_phase, "phase_id": "startup", "step": 0,
@@ -517,7 +559,7 @@ def main(platform: str = 'windows') -> int:
                       private_completion_spec=private_completion_spec, planner_model=planner,
                       verifier_model=verifier,
                       decision_judge=decision_judge,
-                      run_manifest={'task_mode': args.task_mode, 'verification_backend': args.verification_backend},
+                      run_manifest=run_manifest,
                       event_path=os.path.join(args.result_dir, log_name("events.jsonl")) if args.result_dir else None)
         if args.result_dir:
             set_results_dir(args.result_dir, args.run_prefix or '')
@@ -606,9 +648,7 @@ def main(platform: str = 'windows') -> int:
         with open(os.path.join(args.result_dir, log_name("traj_raw.jsonl")), "w", encoding="utf-8") as _f:
             _f.write("\n".join(raw_lines))
         from .trajectory import build_trajectory, dump_trajectory
-        import hashlib
-        task_id = args.task_id or "local-" + hashlib.sha256(args.task.encode()).hexdigest()[:16]
-        traj = build_trajectory(task_id=task_id, domain=platform,
+        traj = build_trajectory(task_id=args.task_id, domain=platform,
                                 instruction=args.task, result=result)
         dump_trajectory(os.path.join(args.result_dir, log_name("trajectory.json")), traj)
         print(f"\n轨迹与截图已保存到: {args.result_dir}")

@@ -35,8 +35,16 @@ app = FastAPI(title="osworld_agent Viz")
 @app.get('/runtime/info')
 async def runtime_info():
     """Identify the actual executor host, including through an SSH tunnel."""
-    return {'service': 'yaero-studio', 'platform': sys.platform,
+    info = {'service': 'yaero-studio', 'platform': sys.platform,
             'project_root': str(_PKG), 'local_execution': True}
+    if sys.platform == 'win32':
+        from ..desktop.desktop_capture import list_desktop_monitors
+        try:
+            info['desktop_monitors'] = await asyncio.to_thread(list_desktop_monitors)
+        except (OSError, ValueError) as exc:
+            info['desktop_monitors'] = []
+            info['desktop_monitors_error'] = str(exc)
+    return info
 
 
 from .jev_debug import router as jev_router
@@ -1187,6 +1195,19 @@ def _local_task_options(cfg):
     if sys.platform.startswith('linux') and mode != 'cli':
         raise ValueError('Linux 本机运行器支持后台文件与终端任务')
     args = ['--task-mode', mode]
+    if mode == 'desktop':
+        from ..desktop.desktop_capture import resolve_desktop_monitor
+        requested = cfg.get('desktop_monitor', 'primary')
+        if not isinstance(requested, str) or not requested.strip():
+            raise ValueError('任务屏幕必须是 primary 或显示器设备标识')
+        try:
+            monitor = resolve_desktop_monitor(requested)
+        except (ValueError, OSError) as exc:
+            raise ValueError(f'无法绑定任务屏幕 {requested}：{exc}') from exc
+        # Freeze the device here so every row of a batch uses the same display.
+        args += ['--desktop-monitor', monitor['id']]
+    elif 'desktop_monitor' in cfg:
+        raise ValueError('任务屏幕仅适用于 Windows 通用桌面任务')
     if cfg.get('verification_backend') not in (None, '', 'configured', 'terra'):
         raise ValueError('验证后端应为 configured 或 terra')
     if cfg.get('verification_backend') == 'terra':

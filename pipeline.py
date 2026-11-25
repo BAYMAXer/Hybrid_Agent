@@ -379,6 +379,10 @@ class Pipeline:
     def _run(self, task: str, result: AgentResult) -> AgentResult:
         state = self._init_state(task)
         self._prepare_initial_state(task, state, result)
+        stop = self._desktop_stop_info(state.obs)
+        if stop:
+            self._record_desktop_stop(result, stop)
+            return result
         # 规划是执行前置条件。小模型规划失败时不盲目开始操作。
         planned = self._plan(task, state)
         result.plan = state.memory.plan
@@ -443,6 +447,8 @@ class Pipeline:
             if callable(set_file_intent):
                 set_file_intent(task, self.completion.public_spec.get('checks', []))
             state.obs = self.env.reset(task)
+            if self._desktop_stop_info(state.obs):
+                return
             self.completion.bind_desktop_files(self.env)
             self.completion.observe(state.obs)
         elif mode == 'cli':
@@ -462,6 +468,10 @@ class Pipeline:
             self._current_step = step_no
             result.steps = step_no
             state = self.preprocess(state)
+            stop = self._desktop_stop_info(state.obs)
+            if stop:
+                self._record_desktop_stop(result, stop)
+                return result
             if step_no == 1:
                 initial = copy.deepcopy(getattr(self.env, "episode_manifest", {}) or
                                         getattr(self.env, "initial_state", {}) or {})
@@ -475,6 +485,10 @@ class Pipeline:
                 messages = self.build_input(state)
             except (ObservationIncompleteError, ImageEncodingError):
                 state.obs = self._observe()
+                stop = self._desktop_stop_info(state.obs)
+                if stop:
+                    self._record_desktop_stop(result, stop)
+                    return result
                 state.screenshot_history[-1] = state.obs.screenshot
                 try:
                     messages = self.build_input(state)
@@ -507,6 +521,10 @@ class Pipeline:
             if decision.action is None:
                 # Retain every sampled output, but bound format/transport recovery.
                 state.obs = self._observe()
+                stop = self._desktop_stop_info(state.obs)
+                if stop:
+                    self._record_desktop_stop(result, stop)
+                    return result
                 self.completion.observe(state.obs)
                 state.verification = self.completion.evaluate()
                 failure = "model_transport" if decision.calls and decision.calls[-1].get("error_type") else "parse_failure"
@@ -580,12 +598,14 @@ class Pipeline:
             execution.info['grounding_ocr_used'] = self._ocr_used
             if not self._logical_grounding_calls:
                 execution.info['grounding_skip_reason'] = (state.route or {}).get('channel') or 'no_coordinate_action'
-            if (execution.info.get('continuation') or {}).get('state') == 'stop':
-                # HCU can report partially delivered input. Even a read/settle may violate its stop contract.
-                result.success = False
-                result.termination_reason = 'desktop_input_uncertain'
-                result.final_answer = execution.info.get('reason') or '桌面执行器报告输入可能已生效，已停止。'
-                result.verification = {'status': 'unknown', 'reason': result.final_answer, 'checks': []}
+            stop = self._desktop_stop_info(execution.obs, execution.info)
+            if not stop:
+                execution = self._settle_action(action, execution, state)
+                stop = self._desktop_stop_info(execution.obs, execution.info)
+            if stop:
+                # Preserve whether the action was already dispatched before its observation stopped.
+                execution.info.update({k: stop[k] for k in ('error_code', 'reason', 'continuation') if k in stop})
+                self._record_desktop_stop(result, stop)
                 entry = {**action_context, 'step': step_no, 'action_id': f'a_{step_no}', 'observation': before,
                          'action': self._compact_action(action), 'execution_info': execution.info,
                          'operation_mode': self._operation_mode(action, state.route), 'policy_output': decision.raw,
@@ -595,7 +615,6 @@ class Pipeline:
                 self._emit('execution', action=entry['action'], execution_info=execution.info)
                 self._emit('transition', transition=entry)
                 return result
-            execution = self._settle_action(action, execution, state)
             self._emit("execution", action=self._compact_action(state.resolved_action or action),
                        execution_info=execution.info, outcome=execution.outcome,
                        next_observation=self._observation_record(execution.obs, f"o_{step_no+1}") if execution.obs else None)
@@ -1174,6 +1193,21 @@ class Pipeline:
         state.last_grounding_coord = self._coordinate_of(visual)
         return recovered
 
+    def _desktop_stop_info(self, obs, execution_info=None):
+        for info in (execution_info, getattr(self.env, 'desktop_stop', None),
+                     (getattr(obs, 'info', None) or {}).get('desktop_stop')):
+            if isinstance(info, dict) and (info.get('continuation') or {}).get('state') == 'stop':
+                return info
+        return None
+
+    def _record_desktop_stop(self, result, stop):
+        code = str(stop.get('error_code') or '')
+        result.success = False
+        result.termination_reason = code if code.startswith(('desktop_monitor_', 'desktop_window_')) else 'desktop_input_uncertain'
+        result.final_answer = stop.get('reason') or '桌面执行器报告输入可能已生效，已停止。'
+        result.verification = {'status': 'unknown', 'reason': result.final_answer, 'checks': []}
+        self._publish_diagnostic('desktop_stopped', error_code=code, reason=result.final_answer)
+
     def _step_environment(self, action):
         context = getattr(self.env, 'framework_wait_context', None)
         if not callable(context):
@@ -1185,6 +1219,9 @@ class Pipeline:
     def execute(self, action: Action, state: StepState) -> Execution:
         name = action.action
         if getattr(self.env, 'task_mode', None) == 'desktop':
+            stop = self._desktop_stop_info(state.obs)
+            if stop:
+                return Execution(kind='rejected', obs=state.obs, done=True, info={**stop, 'dispatched': False})
             from .planning.decision_modes import DESKTOP_ACTIONS, desktop_cli_step
             if (name not in DESKTOP_ACTIONS or (self._active_actions is not None and name not in self._active_actions)
                     or (name == 'cli' and not desktop_cli_step(state.task, state.queue.current if state.queue else None))):

@@ -31,13 +31,15 @@ class WindowsEnvironment(Environment):
                  downloads_dir: Optional[str] = None, workspace_dir: Optional[str] = None,
                  window_timeout_s: float = 15.0, browser_start_url: Optional[str] = None,
                  browser_session_mode: str = "isolated", task_mode: str = "browser",
-                 enable_desktop_ax: bool = True):
+                 enable_desktop_ax: bool = True, desktop_monitor: str = 'primary'):
         if task_mode not in {"browser", "desktop"}:
             raise ValueError('WindowsEnvironment task_mode must be browser or desktop')
         self.task_mode = task_mode
         self._desktop_lock = threading.RLock()
         self._desktop_ax = None
         self._desktop_stop = None
+        self._monitor_selector = desktop_monitor
+        self._task_monitor = None
         self._desktop_lease = None
         self._captured_layouts = ()
         self._captured_shell_windows = set()
@@ -111,6 +113,10 @@ class WindowsEnvironment(Environment):
                 self._window_launch_inflight = False
                 self._window_wait_cancel.clear()
                 self._ensure_desktop_lease()
+                if sys.platform == 'win32':
+                    from ..desktop.monitor_windows import TaskMonitor
+                    self._task_monitor = TaskMonitor(self._monitor_selector)
+                    self.initial_state['desktop_monitor'] = self._task_monitor.monitor.copy()
                 self._episode_prepared = True
                 return dict(self.initial_state)
         session = self._get_browser_session()
@@ -171,12 +177,17 @@ class WindowsEnvironment(Environment):
     def _wait_for_desktop_window(self, target, *, dispatched):
         from ..desktop.desktop_readiness import wait_for_window
         self._pending_window = target
+        read_state = self._runtime_state if self.task_mode == 'desktop' else None
+        if self._task_monitor:
+            read_state = lambda: self._task_monitor.launch_state(self._runtime_state(), target)
         report = wait_for_window(target, timeout_s=self.window_timeout_s,
             emit=self._window_wait_emit, remaining=self._window_wait_remaining,
             cancelled=self._window_wait_cancel.is_set,
-            read_state=self._runtime_state if self.task_mode == 'desktop' else None)
+            read_state=read_state)
         self._last_window_wait = report
         if report['status'] == 'completed':
+            if self._task_monitor and report.get('window'):
+                self._task_monitor.bind(report['window'])
             self._pending_window = None
             self._window_launch_inflight = False
         return {'status': 'executed' if report['status'] == 'completed' else 'uncertain',
@@ -188,9 +199,16 @@ class WindowsEnvironment(Environment):
     # ---- 观察 ----
     def _take_screenshot(self):
         """Desktop fallback; browser screenshots are collected atomically with AX."""
-        from ..desktop.desktop_capture import capture_virtual_desktop
+        from ..desktop.desktop_capture import capture_monitor, capture_virtual_desktop
         self._desktop_capture = {}
-        shot, self._desktop_capture = capture_virtual_desktop()
+        if self.task_mode == 'desktop' and sys.platform == 'win32' and self._task_monitor is None:
+            from ..desktop.monitor_windows import TaskMonitor
+            self._ensure_desktop_lease()
+            self._task_monitor = TaskMonitor(self._monitor_selector)
+        if self._task_monitor:
+            shot, self._desktop_capture = capture_monitor(self._task_monitor.monitor['id'])
+        else:
+            shot, self._desktop_capture = capture_virtual_desktop()
         return shot
 
     def _runtime_state(self):
@@ -272,6 +290,27 @@ class WindowsEnvironment(Environment):
 
         from ..desktop.desktop_readiness import foreground, window_identity
         desktop_before = self._runtime_state() if self._observation_surface == 'desktop' else None
+        window_moved = False
+        if self._task_monitor:
+            from ..desktop.monitor_windows import MonitorStop
+            try:
+                if self._pending_window and self._window_launch_inflight:
+                    from ..desktop.desktop_readiness import matches_target, window_ready
+                    candidate = foreground(self._task_monitor.launch_state(desktop_before, self._pending_window))
+                    if candidate and matches_target(candidate, self._pending_window) and window_ready(candidate):
+                        self._task_monitor.bind(candidate)
+                        self._pending_window = dict(candidate)
+                self._task_monitor.prepare_observation(desktop_before, self._desktop_intent_task)
+                window_moved = self._task_monitor.moved
+                if window_moved:
+                    self._task_monitor.moved = False
+                    if self._desktop_ax:
+                        self._desktop_ax.invalidate()
+                    self._desktop_capture = {}
+                    desktop_before = self._runtime_state()
+            except MonitorStop as exc:
+                self._stop_monitor(exc)
+                return self._stopped_observation()
         screenshot, snapshot, metadata = None, None, {}
         error = ""
         if self._observation_surface == "browser":
@@ -319,9 +358,16 @@ class WindowsEnvironment(Environment):
             # 桌面模式：显式 observe_desktop 才截取全部显示器。
             try:
                 screenshot = self._take_screenshot()
-            except (OSError, RuntimeError) as exc:
+            except (ValueError, OSError, RuntimeError) as exc:
                 error = str(exc)
                 self._desktop_capture = {}
+                if self._task_monitor:
+                    from ..desktop.monitor_windows import MonitorStop
+                    try:
+                        self._task_monitor.refresh()
+                    except MonitorStop as stopped:
+                        self._stop_monitor(stopped)
+                        return self._stopped_observation()
             size = screenshot_size(screenshot)
             info = {"screenshot_space": "screen_pixels",
                     "screenshot_size": list(size) if size else None,
@@ -342,8 +388,15 @@ class WindowsEnvironment(Environment):
         info['control_mode'] = 'background_browser' if info['active_surface'] == 'browser' else 'desktop_takeover'
         info["task_mode"] = self.task_mode
         ax_block, ax_reason = None, ""
+        ax_window = foreground(desktop_before or {})
+        if self._task_monitor:
+            from ..desktop.monitor_windows import window_fits
+            info['desktop_window_moved'] = window_moved
+            if not ax_window or not window_fits(ax_window, self._task_monitor.monitor):
+                ax_window = None
+                info['desktop_foreground_outside_task_monitor'] = True
         if self.task_mode == "desktop" and self._desktop_ax:
-            ax_block, ax_reason = self._desktop_ax.observe(foreground(desktop_before or {}),
+            ax_block, ax_reason = self._desktop_ax.observe(ax_window,
                                                            info.get("desktop_capture_id"))
         info["runtime_state"] = self._runtime_state()
         if self.task_mode == "desktop" and not self._desktop_is_input():
@@ -361,6 +414,8 @@ class WindowsEnvironment(Environment):
                 info['control_mode'] = 'desktop'
                 info['desktop_browser_foreground'] = browser_window(after)
                 info['desktop_focus_stable'] = bool(info['desktop_focus_stable'] and before.get("title") == after.get("title"))
+                if self._task_monitor:
+                    info['desktop_focus_stable'] = bool(info['desktop_focus_stable'] and before.get('bounds') == after.get('bounds'))
                 kind, confirmation_text = common_file_dialog(after, ax_block if info['desktop_focus_stable'] else None)
                 info["desktop_file_dialog"] = kind == "picker"
                 info["desktop_overwrite_protected"] = kind == "overwrite" and self._overwrite_protected(confirmation_text)
@@ -380,7 +435,8 @@ class WindowsEnvironment(Environment):
                 info['desktop_ax_status'] = ('available' if context else ax_reason or 'foreground_changed')
                 if self._pending_window and (self._last_window_wait or {}).get('status') == 'timeout':
                     from ..desktop.desktop_readiness import matches_target, window_ready
-                    if (info['desktop_focus_stable'] and window_ready(before) and window_ready(after)
+                    eligible = (not self._task_monitor or not self._window_launch_inflight or self._pending_window.get('hwnd'))
+                    if (eligible and info['desktop_focus_stable'] and window_ready(before) and window_ready(after)
                             and before['bounds'] == after['bounds'] and matches_target(after, self._pending_window)):
                         self._last_window_wait = {**self._last_window_wait, 'status': 'completed', 'window': dict(after),
                             'detail': '先前等待超时，新的桌面截图前后已确认目标窗口在前台且可接收输入'}
@@ -535,12 +591,33 @@ class WindowsEnvironment(Environment):
                 if self._window_wait_cancel.is_set() or (self._window_wait_remaining and self._window_wait_remaining() <= 0):
                     return StepResult(self.observe(), info={"channel": "desktop_ax", "status": "rejected",
                                       "dispatched": False, "error_code": "desktop_operation_cancelled"})
-                result = self._desktop_ax.execute(action, route, lambda:
-                    foreground(self._runtime_state()) if self._desktop_is_input() else None)
+                def ax_window():
+                    live_state = self._runtime_state() if self._desktop_is_input() else {}
+                    current = foreground(live_state)
+                    if current and self._task_monitor:
+                        from ..desktop.monitor_windows import MonitorStop, window_fits
+                        try:
+                            monitor = self._task_monitor.refresh()
+                            self._task_monitor.guard_focus(live_state)
+                        except MonitorStop as exc:
+                            self._stop_monitor(exc)
+                            return None
+                        before = foreground(self._last_observation_info.get('runtime_state', {})) or {}
+                        if (monitor != self._desktop_capture.get('desktop_monitor', monitor)
+                                or current.get('bounds') != before.get('bounds') or not window_fits(current, monitor)):
+                            return None
+                    return current
+
+                result = self._desktop_ax.execute(action, route, ax_window)
                 if (result.get("continuation") or {}).get("state") == "stop":
                     self._desktop_stop = result
                     return StepResult(self._stopped_observation(), done=True, info=result)
-                return StepResult(self.observe(), info=result)
+                if self._task_monitor and result.get('dispatched') and not self._task_monitor.root:
+                    before = foreground(self._last_observation_info.get('runtime_state', {}))
+                    if before:
+                        from ..desktop.desktop_readiness import window_identity
+                        self._task_monitor.root = window_identity(before)
+                return self._monitor_result(StepResult(self.observe(), info=result))
         if action.action in {"download", "rename_artifact", "run_in_terminal", "call_code_agent", "set_cell_values", "save"}:
             return StepResult(self.observe(), info={"status": "rejected", "dispatched": False,
                 "error_code": "non_basic_action", "action": action.action})
@@ -581,7 +658,28 @@ class WindowsEnvironment(Environment):
 
     def _stopped_observation(self):
         return Observation(info={"task_mode": "desktop", "active_surface": "desktop", "screenshot_stale": True,
-                                 "observation_error": "HCU 已指示停止，本次任务无法继续观察", "initial_state": self.initial_state})
+                                 "observation_error": (self._desktop_stop or {}).get('reason') or "HCU 已指示停止，本次任务无法继续观察",
+                                 "desktop_stop": self.desktop_stop,
+                                 "initial_state": self.initial_state})
+
+    @property
+    def desktop_stop(self):
+        with self._desktop_lock:
+            return dict(self._desktop_stop or {})
+
+    def _stop_monitor(self, exc):
+        self._desktop_capture = {}
+        if self._desktop_ax:
+            self._desktop_ax.invalidate()
+        self._desktop_stop = dict(status='rejected', dispatched=False, channel='desktop',
+                                  error_code=exc.code, reason=str(exc), continuation={'state': 'stop'})
+
+    def _monitor_result(self, result):
+        if self._desktop_stop and not result.done:
+            if result.info.get('dispatched'):
+                self._desktop_stop['dispatched'] = True
+            return StepResult(self._stopped_observation(), done=True, info=dict(self._desktop_stop))
+        return result
 
     def step(self, action: Action) -> StepResult:
         if self.task_mode == "desktop":
@@ -589,7 +687,12 @@ class WindowsEnvironment(Environment):
                 self._ensure_desktop_lease()
                 if self._desktop_stop:
                     return StepResult(self._stopped_observation(), done=True, info=dict(self._desktop_stop))
-                return self._step(action)
+                from ..desktop.monitor_windows import MonitorStop
+                try:
+                    return self._monitor_result(self._step(action))
+                except MonitorStop as exc:
+                    self._stop_monitor(exc)
+                    return StepResult(self._stopped_observation(), done=True, info=dict(self._desktop_stop))
         return self._step(action)
 
     def _step(self, action: Action) -> StepResult:
@@ -644,7 +747,8 @@ class WindowsEnvironment(Environment):
                             raise OSError("无法核实目标窗口位置")
                         layouts = (*self._captured_layouts, current_state["_window_layout"]) if "_window_layout" in current_state else ()
                         guard_error = pointer_guard(action, self._desktop_capture.get("screen_origin", [0, 0]), browser_handles,
-                                                    layouts, leaving_browser=leaving_browser, shell_handles=shell_handles)
+                                                    layouts, leaving_browser=leaving_browser, shell_handles=shell_handles,
+                                                    monitor=self._desktop_capture.get('desktop_monitor'))
                     except OSError:
                         return StepResult(self.observe(), info={"status": "rejected", "dispatched": False,
                                           "error_code": "desktop_pointer_unconfirmed", "channel": "desktop"})
@@ -713,11 +817,31 @@ class WindowsEnvironment(Environment):
         name = action.action
         if name == 'switch_applications':
             from ..desktop.desktop_state import switch_windows_application, windows_application_process
+            if self._task_monitor:
+                from ..desktop.desktop_readiness import foreground, window_identity
+                from ..desktop.monitor_windows import MonitorStop
+                self._task_monitor.refresh()
+                if self._task_monitor.root:
+                    observed = foreground(self._last_observation_info.get('runtime_state', {}))
+                    state = self._runtime_state()
+                    self._task_monitor.guard_focus(state)
+                    current = foreground(state)
+                    if not current or window_identity(observed) != window_identity(current):
+                        raise MonitorStop('desktop_window_focus_changed', '切换目标应用前检测到前台变化，已停止桌面输入')
             process = windows_application_process(action.args.get('app_code'))
-            if sys.platform == 'win32' and process:
+            if sys.platform == 'win32' and process and not self._task_monitor:
                 self._pending_window = {'process_name': process + '.exe'}
                 self._window_launch_inflight = False
-            result = switch_windows_application(action.args.get('app_code'))
+            if self._task_monitor:
+                result = switch_windows_application(action.args.get('app_code'),
+                    task=self._desktop_intent_task, window_title=str(action.args.get('window_title') or ''),
+                    bind=self._task_monitor.bind)
+                if result.get('error_code') == 'ambiguous_application':
+                    from ..desktop.monitor_windows import MonitorStop
+                    raise MonitorStop('desktop_window_ambiguous', '多个窗口符合任务目标，无法确认要操作的窗口：'
+                                      + '、'.join(result.get('candidates') or ()))
+            else:
+                result = switch_windows_application(action.args.get('app_code'))
             if sys.platform == 'win32' and result.get('window') and result.get('status') in {'executed', 'observed', 'uncertain'}:
                 result.update(self._wait_for_desktop_window(result['window'], dispatched=result['dispatched']))
                 if result['framework_wait']['status'] == 'completed':
@@ -733,8 +857,18 @@ class WindowsEnvironment(Environment):
                           and not global_shortcut(action))
         observed = self._last_observation_info
         def guard_input():
-            check_keyboard_focus(observed.get('runtime_state', {}), self._runtime_state(),
+            live_state = self._runtime_state()
+            current = check_keyboard_focus(observed.get('runtime_state', {}), live_state,
                 pending_target=self._pending_window, capture_stable=observed.get('desktop_focus_stable') is True)
+            if self._task_monitor:
+                from ..desktop.desktop_readiness import foreground
+                from ..desktop.monitor_windows import window_fits
+                self._task_monitor.guard_focus(live_state)
+                monitor = self._task_monitor.refresh()
+                previous = foreground(observed.get('runtime_state', {})) or {}
+                if (current.get('bounds') != previous.get('bounds') or not window_fits(current, monitor)
+                        or monitor != self._desktop_capture.get('desktop_monitor', monitor)):
+                    raise DesktopFocusError('目标窗口位置或显示器已变化，请重新观察任务屏')
         if keyboard_guard:
             try:
                 guard_input()
@@ -748,6 +882,11 @@ class WindowsEnvironment(Environment):
             if self._desktop_capture:
                 from ..desktop.desktop_capture import validate_desktop_action, virtual_geometry
                 mapped, origin = validate_desktop_action(action, self._desktop_capture, virtual_geometry())
+                if self._task_monitor and name != 'wait':
+                    monitor_error = self._prepare_monitor_input(action, origin)
+                    if monitor_error:
+                        return StepResult(self.observe(), info=dict(status='rejected', dispatched=False,
+                            channel='desktop', error_code='desktop_monitor_reobserve', reason=monitor_error))
                 cmd = to_pyautogui(mapped, desktop_origin=origin, keyboard_guard=keyboard_guard,
                                    literal_click=self.task_mode == "desktop")
             else:
@@ -790,6 +929,59 @@ class WindowsEnvironment(Environment):
         return StepResult(observation=self.observe(), info={
             "status": "rejected", "dispatched": False, "channel": "desktop",
             "error": "unsupported action or invalid coordinates"})
+
+    def _prepare_monitor_input(self, action, origin):
+        from ..desktop.desktop_readiness import foreground, window_identity, global_shortcut, launch_target
+        from ..desktop.desktop_state import point_window
+        from ..desktop.monitor_windows import window_fits
+        scope = self._task_monitor
+        monitor = scope.refresh()
+        if self._desktop_capture.get('desktop_monitor', monitor) != monitor:
+            return '任务屏幕的尺寸或 DPI 已变化，请重新观察'
+        current_state = self._runtime_state()
+        scope.guard_focus(current_state)
+        current = foreground(current_state)
+        previous = foreground(self._last_observation_info.get('runtime_state', {}))
+        if (not current or window_identity(current) != window_identity(previous)
+                or current.get('bounds') != previous.get('bounds') or current.get('title') != previous.get('title')):
+            return '前台窗口已变化，请重新观察后再操作'
+        if global_shortcut(action):
+            keys = {str(k).lower() for k in action.args.get('keys') or [action.args.get('key')]}
+            keys = {'win' if k in {'winleft', 'winright'} else k for k in keys}
+            if keys in ({'alt','tab'}, {'alt','shift','tab'}) or 'win' in keys and keys & {'left','right'}:
+                return '固定屏幕任务请按名称切换目标窗口，不能使用跨屏或盲切窗口的快捷键'
+            if not launch_target(action) and not window_fits(current, monitor):
+                return '当前前台在任务屏外，请先通过 switch_applications 确认目标窗口'
+            if launch_target(action):
+                scope.launch_baseline = {window_identity(w) for w in current_state.get('applications', [])}
+            scope.shell_transition = keys in ({'win'}, {'win','r'}, {'win','s'})
+            return ''
+        target = current
+        point = ('x1','y1') if action.action == 'drag_and_drop' else ('x','y')
+        if all(k in action.args for k in point):
+            hit = point_window(action.args[point[0]] + origin[0], action.args[point[1]] + origin[1])
+            match = next((w for w in current_state['applications'] if w.get('hwnd') == hit), None)
+            if match:
+                target = match
+        in_shell = (target.get('shell_surface') or target.get('class_name') in
+                    {'Shell_TrayWnd','Shell_SecondaryTrayWnd','Progman','WorkerW'}
+                    or target.get('class_name') == '#32770' and target.get('process_name', '').lower() == 'explorer.exe')
+        if in_shell or scope.shell_transition:
+            scope.expect_shell_action(action)
+        if not window_fits(target, monitor):
+            if not in_shell and all(k in action.args for k in point):
+                scope.bind(target)
+                return '已将点选目标移入任务屏，请按新截图定位'
+            return '目标窗口位于任务屏外，请用 switch_applications 明确选择窗口'
+        if in_shell:
+            scope.shell_transition = True
+        elif not scope.owns(target, current_state):
+            scope.bind(target)
+        keys = {str(k).casefold() for k in action.args.get('keys', [])}
+        if not in_shell and action.action == 'hotkey' and keys == {'ctrl', 'n'}:
+            scope.launch_process = target.get('process_name', '').casefold().removesuffix('.exe')
+            scope.new_app_baseline = {window_identity(w) for w in current_state.get('applications', [])}
+        return ''
 
     # ---- 浏览器操作 ----
     def browser_action(self, action_name: str, args: Dict[str, Any]) -> str:

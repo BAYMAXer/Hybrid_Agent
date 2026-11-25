@@ -182,6 +182,7 @@ def system_sections(names, obs, os_name="linux", *, profile=None, task="", step=
         if search_stage:
             sections.append(("paper_search", paper_search_instruction(task) + '\n' + PAPER_SEARCH_PROMPT))
     tips = {"cli": ACTION_REGISTRY["cli"].description, "hotkey": "keys为非空数组", "scroll": "direction=up/down，amount为正整数",
+            "switch_applications": "app_code 为应用标识；Windows 同一应用有多个窗口时，window_title 可指定已观察到的精确标题",
             "wait": "0<seconds<=60", "goto": "网址放url，不放target",
             "observe_desktop": "切到桌面并取得新截图", "observe_browser": "重新观察网页并选择模式",
             "get_page_source": "仅AX不足时读取精简源码", "switch_tab": "tab_id来自当前标签列表",

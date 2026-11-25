@@ -25,6 +25,7 @@ def windows_runtime_state(*, include_layout=False):
         user.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
         user.IsWindowVisible.argtypes = [wintypes.HWND]
         user.GetForegroundWindow.restype = wintypes.HWND
+        user.GetWindow.argtypes, user.GetWindow.restype = [wintypes.HWND, wintypes.UINT], wintypes.HWND
         user.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
         user.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
         for name in ('IsIconic', 'IsWindowEnabled', 'IsHungAppWindow'):
@@ -60,7 +61,9 @@ def windows_runtime_state(*, include_layout=False):
                     return True
                 if enumerated and include_layout and bounds and not user.IsIconic(hwnd) and not cloaked.value:
                     layout.append((int(hwnd), tuple(bounds)))
-                if not title.value and hwnd != foreground and not shell_only:
+                owner = user.GetWindow(hwnd, 4)  # GW_OWNER, not the previous foreground HWND.
+                owner = owner if isinstance(owner, int) else None
+                if not title.value and hwnd != foreground and not shell_only and not owner:
                     return True
                 pid = wintypes.DWORD()
                 user.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
@@ -77,10 +80,15 @@ def windows_runtime_state(*, include_layout=False):
                 if shell_only and not surface:
                     return True
                 if not title.value and not surface and class_name.value not in {
-                        'Progman', 'WorkerW', 'Shell_TrayWnd', 'Shell_SecondaryTrayWnd'}:
+                        'Progman', 'WorkerW', 'Shell_TrayWnd', 'Shell_SecondaryTrayWnd'} and not owner:
                     return True
+                frame = wintypes.RECT()
+                frame_ok = (include_layout and dwm.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(frame), ctypes.sizeof(frame)) == 0
+                            and frame.right > frame.left and frame.bottom > frame.top)
                 apps.append({"process_name": process_name, "pid": pid.value, "title": title.value,
                              "hwnd": int(hwnd), "class_name": class_name.value, "foreground": hwnd == foreground,
+                             "owner_hwnd": owner,
+                             **({"frame_bounds": [frame.left, frame.top, frame.right, frame.bottom]} if frame_ok else {}),
                              "bounds": bounds, "visible": True, "minimized": bool(user.IsIconic(hwnd)),
                              "enabled": bool(user.IsWindowEnabled(hwnd)), "responsive": not bool(user.IsHungAppWindow(hwnd)),
                              "cloaked": bool(cloaked.value) if cloak_ok else None,
@@ -138,7 +146,7 @@ _APP_ALIASES = {
     '文件资源管理器': 'explorer', 'windows_file_explorer': 'explorer',
     'chrome': 'chrome', 'google_chrome': 'chrome', 'google chrome': 'chrome',
     'edge': 'msedge', 'microsoft_edge': 'msedge', 'microsoft edge': 'msedge',
-    'firefox': 'firefox', 'notepad': 'notepad',
+    'firefox': 'firefox', 'notepad': 'notepad', 'word': 'winword', 'powerpoint': 'powerpnt',
 }
 
 
@@ -159,7 +167,20 @@ def shell_pointer_windows(runtime):
             if w.get('shell_surface') and window_ready(w, require_foreground=False)}
 
 
-def pointer_guard(action, origin, browser_handles, layouts, *, leaving_browser=False, shell_handles=None):
+def point_window(x, y):
+    """Top-level HWND at a physical display point, including an owned popup."""
+    import ctypes
+    from ctypes import wintypes
+    from .desktop_capture import physical_dpi_context
+    user = ctypes.WinDLL('user32', use_last_error=True)
+    user.WindowFromPoint.argtypes, user.WindowFromPoint.restype = [wintypes.POINT], wintypes.HWND
+    user.GetAncestor.argtypes, user.GetAncestor.restype = [wintypes.HWND, wintypes.UINT], wintypes.HWND
+    with physical_dpi_context():
+        return user.GetAncestor(user.WindowFromPoint(wintypes.POINT(int(x), int(y))), 2)
+
+
+def pointer_guard(action, origin, browser_handles, layouts, *, leaving_browser=False, shell_handles=None,
+                  monitor=None):
     """Recheck local window geometry at the gesture points, including background windows."""
     if sys.platform != 'win32':
         return ""
@@ -184,6 +205,9 @@ def pointer_guard(action, origin, browser_handles, layouts, *, leaving_browser=F
                 if all(type(v) in (int, float) and math.isfinite(v) and 0 <= v < 2**30 for v in values):
                     points.append(wintypes.POINT(int(values[0]) + origin[0], int(values[1]) + origin[1]))
         for p in points:
+            if monitor and not (monitor['left'] <= p.x < monitor['left'] + monitor['width']
+                                and monitor['top'] <= p.y < monitor['top'] + monitor['height']):
+                return "desktop_pointer_outside_monitor"
             owner = user.GetAncestor(user.WindowFromPoint(p), 2)
             if owner in browser_handles or (leaving_browser and not owner):
                 return "browser_task_out_of_scope"
@@ -277,21 +301,33 @@ def _activate_window(hwnd):
         time.sleep(.05)
 
 
-def switch_windows_application(app_code):
+def switch_windows_application(app_code, *, window_title='', task='', bind=None):
     """Activate one matching existing window, or report why no switch occurred."""
     process = windows_application_process(app_code)
     result = {'action': 'switch_applications', 'app_code': app_code, 'channel': 'desktop', 'dispatched': False}
     if not process:
         return {**result, 'status': 'rejected', 'error_code': 'unknown_application',
                 'reason': 'app_code 必须是应用标识或进程名，不能是命令；也可通过任务栏或系统启动器操作。'}
-    runtime = windows_runtime_state()
+    runtime = windows_runtime_state(include_layout=True) if bind else windows_runtime_state()
     matches = [a for a in runtime.get('applications', [])
                if str(a.get('process_name', '')).casefold().removesuffix('.exe') == process and a.get('hwnd')
                and a.get('cloaked') is not True]
     if process == 'explorer':
         # explorer.exe also owns the desktop and taskbar; those are not folders.
         matches = [a for a in matches if a.get('class_name') in {'CabinetWClass', 'ExploreWClass'}]
-    current = next((a for a in matches if a.get('foreground')), None)
+    if bind:
+        from .monitor_windows import document_title, task_named_windows
+        if window_title:
+            title = window_title.strip().casefold()
+            exact = [w for w in matches if title in (w['title'].casefold(), document_title(w['title']))]
+            matches = exact or task_named_windows(matches, title)
+        else:
+            named = task_named_windows(matches, task)
+            if named:
+                matches = named
+        if len(matches) == 1:
+            bind(matches[0])
+    current = next((a for a in matches if a.get('foreground')), None) if not bind or len(matches) == 1 else None
     if current:
         return {**result, 'status': 'observed', 'reason': '目标应用已在前台，请继续操作窗口内容，不要反复切换。',
                 'window': current}
