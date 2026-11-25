@@ -64,6 +64,7 @@ def compile_plan(obj, task, public_spec, task_profile, paper_goals, *, repair=Fa
     Existing execution_queue refinements and error wording are preserved.
     """
     check_ids = {c["id"] for c in public_spec.get("checks", [])}
+    desktop_files = {c['id'] for c in public_spec.get('checks', []) if c.get('kind') == 'desktop_file'}
     steps = obj.get("steps") if isinstance(obj, dict) else None
     if not isinstance(steps, list) or not 1 <= len(steps) <= MAX_PLAN_STEPS:
         raise ValueError(f"steps 必须是非空子目标列表；资源上限为 {MAX_PLAN_STEPS} 项，请合并同一目标的零碎动作")
@@ -92,6 +93,23 @@ def compile_plan(obj, task, public_spec, task_profile, paper_goals, *, repair=Fa
             raise ValueError(f"第 {i} 个子目标缺少 verification；视觉核查请显式填写 visual 条件")
         try:
             proposed = step.get('verification')
+            reference_only = False
+            if not browser_workflow and desktop_files and isinstance(proposed, list) and 1 <= len(proposed) <= 8:
+                # A bare reference to a known immutable file contract carries
+                # exactly the same obligation as an entry in check_ids.
+                predicates = []
+                referenced = []
+                for item in proposed:
+                    if (isinstance(item, dict) and set(item) <= {'id', 'kind'}
+                            and isinstance(item.get('id'), str) and item['id'] in desktop_files
+                            and item.get('kind', 'desktop_file') == 'desktop_file'):
+                        referenced.append(item['id'])
+                    else:
+                        predicates.append(item)
+                if referenced:
+                    ids = list(dict.fromkeys([*ids, *referenced]))
+                    proposed = predicates
+                    reference_only = not predicates
             if isinstance(proposed, list):
                 # The planner sometimes copies a public unresolved requirement
                 # into step predicates. It is a semantic obligation, never a
@@ -153,7 +171,7 @@ def compile_plan(obj, task, public_spec, task_profile, paper_goals, *, repair=Fa
                     else:
                         adjusted.append(predicate)
                 proposed = [p for i, p in enumerate(adjusted) if p not in adjusted[:i]]
-            verification = [] if ids and "verification" not in step else normalize_verification(proposed)
+            verification = [] if ids and ("verification" not in step or reference_only) else normalize_verification(proposed)
         except ValueError as exc:
             raise ValueError(f"第 {i} 个子目标 verification：{exc}") from exc
         for predicate in verification:

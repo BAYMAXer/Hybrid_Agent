@@ -24,6 +24,27 @@ def compile_steps(steps, repair=False):
     return compile_plan({'steps': steps}, '创建 test.docx', {'checks': []}, {'kind': 'desktop'}, [], repair=repair)
 
 
+def test_word_contract_references_bind_the_original_check_without_overrides():
+    contract = {'checks': [{'id': 'word-file', 'kind': 'desktop_file', 'path': 'test.docx',
+                            'format': 'docx', 'change': 'created'}]}
+
+    def compile_checks(checks):
+        return compile_plan({'steps': [step('保存', verification=checks)]}, '创建 test.docx',
+                            contract, {'kind': 'desktop'}, [], repair=True)
+
+    reference = {'id': 'word-file', 'kind': 'desktop_file'}
+    only = compile_checks([reference, {'id': 'word-file'}])
+    assert only['steps'][0]['check_ids'] == ['word-file']
+    assert only['steps'][0]['verification'] == []
+    assert only['completion_spec'] == contract
+    visual = {'kind': 'visual'}
+    assert compile_checks([visual, reference])['steps'][0]['verification'] == [visual]
+    for invalid in ({'id': 'unknown'}, {**reference, 'path': 'other.docx'},
+                    {'id': 'word-file', 'kind': 'fake'}, {'kind': 'file_content', 'path': 'test.docx', 'text': ''}):
+        with pytest.raises(ValueError, match='verification'):
+            compile_checks([reference, invalid])
+
+
 def test_actions_are_optional_hints_and_cannot_grant_cli():
     plan = compile_steps([step('创建', actions=['右键点击并选择新建', 'press_key', 'press', {}, 'cli'])])
     assert plan['steps'][0]['actions'] == ['press', 'cli']

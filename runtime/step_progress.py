@@ -9,7 +9,7 @@ import json
 import ntpath
 import re
 
-from ..desktop.desktop_readiness import launch_target
+from ..desktop.desktop_readiness import foreground, launch_target, window_identity, window_ready
 from ..desktop.desktop_state import windows_application_process
 from ..desktop.explorer_location import committed_explorer_path, filesystem_path, ready_explorer
 
@@ -74,6 +74,47 @@ def _is_target_folder(folder, task, public_checks, step):
     return False
 
 
+def _save_target(step, task, public_checks):
+    """A save dialog can advance only an active step that delivers a named file."""
+    step = step or {}
+    goal = step.get('goal', '')
+    if not re.search(r'保存|另存|创建|新建|\bsav(?:e|ing)\b|\bcreat(?:e|ing)\b', goal, re.I):
+        return False
+    trusted = {ntpath.normcase(filesystem_path(c.get('path'))) for c in public_checks or ()
+               if c.get('kind') in {'desktop_file', 'file_exists'} and c.get('file_type') != 'directory'}
+    checks = list(step.get('verification') or ())
+    checks.extend(c for c in public_checks or () if c.get('id') and c['id'] in (step.get('check_ids') or ()))
+    for check in checks:
+        if check.get('kind') not in {'desktop_file', 'file_exists'} or check.get('file_type') == 'directory':
+            continue
+        path = filesystem_path(check.get('path'))
+        if path and (ntpath.normcase(path) in trusted or _task_names_path(task, path)):
+            return True
+    return False
+
+
+def _native_frame(obs):
+    info = getattr(obs, 'info', None) or {}
+    runtime = info.get('runtime_state') or {}
+    if (info.get('desktop_capture_source') != 'win32_task_monitor' or not info.get('desktop_capture_id')
+            or runtime.get('source') != 'windows_window_api' or not info.get('desktop_focus_stable')
+            or any(info.get(k) for k in ('screenshot_stale', 'desktop_window_moved', 'desktop_stop',
+                   'desktop_foreground_outside_task_monitor', 'desktop_window_selection_required'))):
+        return {}, None
+    return info, foreground(runtime)
+
+
+def _requests_save(action, owner):
+    if action.action == 'press' and str(action.args.get('key', '')).casefold() == 'f12':
+        return owner.get('process_name', '').casefold() == 'winword.exe' and owner.get('class_name') == 'OpusApp'
+    if action.action == 'hotkey':
+        keys = {str(k).casefold() for k in action.args.get('keys', ())}
+        return keys in ({'ctrl','s'}, {'ctrl','shift','s'})
+    if action.action in {'click', 'double_click'}:
+        return bool(re.search(r'另存为|保存为|保存|\bsave(?: as)?\b', str(action.args.get('target', '')), re.I))
+    return False
+
+
 class StepProgressMonitor:
     def __init__(self, config=None):
         self.config = config or ProgressConfig()
@@ -82,6 +123,7 @@ class StepProgressMonitor:
         self.seen = set()
         self.attempts = []
         self.collected_seen = set()
+        self.save_owner = None
 
     def _fresh(self, key):
         key = json.dumps(key, sort_keys=True, ensure_ascii=False)
@@ -89,6 +131,45 @@ class StepProgressMonitor:
             return False
         self.seen.add(key)
         return True
+
+    def _save_dialog_progress(self, before, after, action, info, step, task, public_checks, evidence):
+        """Match a dispatched save to its owned picker, which may appear on a later observation."""
+        if not action or info.get('status') != 'executed' or info.get('error_code'):
+            self.save_owner = None
+            return ''
+        old, owner = _native_frame(before)
+        new, current = _native_frame(after)
+        if not old or not new or not owner or not current:
+            self.save_owner = None
+            return ''
+        requested = (info.get('dispatched') is True and not old.get('desktop_file_dialog') and window_ready(owner)
+                     and _requests_save(action, owner) and _save_target(step, task, public_checks))
+        if requested:
+            self.save_owner = window_identity(owner)
+        if not self.save_owner:
+            return ''
+        observing = action.action in {'wait', 'observe_desktop'}
+        if window_identity(current) == self.save_owner and not old.get('desktop_file_dialog') and (requested or observing):
+            return ''
+        if not old.get('desktop_file_dialog') and not (requested or observing):
+            self.save_owner = None
+            return ''
+        native_owner = next((w for w in new['runtime_state'].get('applications', ())
+                             if window_identity(w) == self.save_owner), None)
+        if (new.get('desktop_file_dialog') is not True or not window_ready(current) or not native_owner
+                or native_owner.get('enabled') is not False or not native_owner.get('visible')
+                or current.get('class_name') != '#32770' or current['pid'] != native_owner['pid']
+                or current.get('owner_hwnd') != native_owner['hwnd']
+                or current.get('title', '').strip().casefold() not in {'另存为','保存为','保存','save as','save'}):
+            self.save_owner = None
+            return ''
+        if (not old.get('desktop_file_dialog') and window_identity(owner) == self.save_owner
+                and self.explorations < self.config.exploration_allowance
+                and self._fresh(['save_picker_ready', self.save_owner])):
+            self.explorations += 1
+            evidence.append('系统确认任务窗口的保存对话框首次在前台就绪（有界探索宽限）')
+        return ('已观察到任务窗口的保存对话框。替换预填文件名时使用 type 的 overwrite=true；'
+                '若截图只显示刚输入路径的一部分，先重新观察。核对完整路径后按 Enter 或点击保存，文件落盘后再验收。')
 
     def _explorer_progress(self, before, after, action, task, public_checks, step, evidence):
         new_window = ready_explorer(after)
@@ -124,6 +205,7 @@ class StepProgressMonitor:
         if step_id != self.step_id:
             self.step_id = step_id
             self.idle = self.decisions = self.explorations = 0
+            self.save_owner = None
             self.seen.clear()
             self.attempts.clear()
             self._fresh(['url', _url(before)])
@@ -156,9 +238,10 @@ class StepProgressMonitor:
                     evidence.append('当前步骤的一个代码检查项已满足')
             moved = (getattr(after, 'info', None) or {}).get('desktop_window_moved')
             successful = not moved and not info.get('error_code') and info.get('status') == 'executed'
+            navigation_feedback = self._save_dialog_progress(before, after, action, info, step, task, public_checks, evidence)
             if successful:
                 if info.get('dispatched') is not False:
-                    navigation_feedback = self._explorer_progress(before, after, action, task, public_checks, step, evidence)
+                    navigation_feedback = navigation_feedback or self._explorer_progress(before, after, action, task, public_checks, step, evidence)
                 old_controls = _controls(before)
                 if name in {'type', 'press', 'hotkey', 'select', 'click'}:
                     for key, value in _controls(after).items():

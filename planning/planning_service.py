@@ -51,6 +51,8 @@ class PlanningService:
                       "app 字段为真实 Windows 进程名。指定应用时必须实际操作该应用，不能用命令行替代；单独文件/终端任务可给 actions:[\"cli\"]。"
                       "启动应用、输入和保存可合并成可核查的自然里程碑。用户要求的文件内容、格式、路径要写明，保存结果给出文件回读谓词。"
                       "file_exists 同时指定 file_type=file 或 directory。步骤内临时文件谓词加 scope=milestone；最终交付文件使用 scope=final。"
+                      "已有 desktop_file 验收用步骤的 check_ids 字符串数组引用下文的实际 ID，该条件只写在 check_ids。"
+                      "空白 Word 文档也可以通过该文件条件校验。file_content 的 text 必须非空。"
                       "保留原任务交付与操作要求，只允许引用以下公开检查 ID：" +
                       json.dumps(public_spec.get('checks', []), ensure_ascii=False))
             if wants_report(task, desktop=True):
