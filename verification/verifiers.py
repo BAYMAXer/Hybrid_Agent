@@ -20,7 +20,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from ..planning.task_specs import infer_paper_spec
 from ..papers.paper_resolver import arxiv_id_from_url, is_verified_binding, query_matches_title
-from .desktop_files import check_desktop_file, normalize_desktop_file, sample_desktop_file
+from .desktop_files import check_desktop_file, named_docx_creation, normalize_desktop_file, sample_desktop_file
 
 
 def _url(value):
@@ -153,7 +153,7 @@ def _normalize_spec(spec):
 
 def _infer_spec(task, task_mode=None):
     if task_mode in {'desktop', 'cli'}:
-        return {'checks': []}
+        return _normalize_spec(named_docx_creation(task) or {'checks': []})
     paper = infer_paper_spec(task)
     if paper:
         return _normalize_spec(paper)

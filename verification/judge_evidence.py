@@ -260,6 +260,10 @@ def select_frame(obs, step=None, execution=None, other=None, *, max_nodes=40):
              'selection': {'nodes_total': len(all_nodes), 'nodes_selected': len(selected),
                            'artifacts_total': len(artifacts), 'artifacts_selected': len(selected_artifacts),
                            'truncated': len(selected) < len(all_nodes) or len(selected_artifacts) < len(artifacts)}}
+    if info.get('explorer_location'):
+        from ..desktop.explorer_location import committed_explorer_path
+        folder = committed_explorer_path(obs)
+        frame['explorer_location'] = ({'status': 'observed', 'path': folder} if folder else {'status': 'unknown'})
     if native := desktop_blocks(obs):
         frame['desktop_windows'] = [{k: bounded(b[k], 240, 8) for k in (
             'window_ref', 'title', 'app', 'complete', 'truncated') if k in b} for b in native[:4]]

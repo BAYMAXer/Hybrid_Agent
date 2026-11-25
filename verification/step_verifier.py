@@ -46,7 +46,7 @@ def _url(value):
 
 def unresolved_desktop_checks(report):
     """A screenshot/model cannot supply missing OS input readiness evidence."""
-    return any(c.get('kind') in {'app_foreground', 'app_ready', 'file_exists', 'file_absent', 'file_content', 'files_equal'} and c.get('status') != 'passed'
+    return any(c.get('kind') in {'app_foreground', 'app_ready', 'file_exists', 'file_absent', 'file_content', 'files_equal', 'explorer_folder_equals'} and c.get('status') != 'passed'
                for c in report.get('checks', []))
 
 
@@ -163,7 +163,16 @@ def code_review(step, obs, execution_info, contract):
     for predicate in step.get("verification", [{"kind": "visual"}]):
         kind = predicate["kind"]
         status, reason, evidence = "unknown", "此条件需要独立模型核查", []
-        if kind in {'file_exists', 'file_absent', 'file_content', 'files_equal'}:
+        if kind == 'explorer_folder_equals':
+            import ntpath
+            from ..desktop.explorer_location import committed_explorer_path, filesystem_path
+            folder = committed_explorer_path(obs)
+            if folder:
+                status = 'passed' if ntpath.normcase(folder) == ntpath.normcase(filesystem_path(predicate['path'])) else 'failed'
+                reason, evidence = '核对资源管理器活动视图的完整文件系统目录', [folder]
+            else:
+                reason = '资源管理器前台活动目录尚未由 Windows Shell 确认'
+        elif kind in {'file_exists', 'file_absent', 'file_content', 'files_equal'}:
             sample = next((c['result'] for c in info.get('cli_checks', []) if c.get('predicate') == predicate), {})
             if sample.get('status') == 'executed':
                 fact = sample.get('file', {})

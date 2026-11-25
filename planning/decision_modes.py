@@ -57,9 +57,10 @@ def desktop_cli_step(task, step):
     terminal = r"(?:命令行|终端|后台|PowerShell|\bCLI\b|\bshell\b)"
     if re.search(r"(?:禁止|不要|不得|不允许|不使用|without|do not|don't)[^，。；;.]{0,16}" + terminal, task, re.I):
         return False
-    method = (r"(?:打开|启动|使用|通过|用|在|\buse\b|\busing\b|\bwith\b|\bin\b|\bopen\b|\blaunch\b)\s*"
-              r"(?:微软\s*|Microsoft\s*)?(?:Excel|Word\b|PowerPoint|Notepad|Paint|Explorer|Calculator|"
-              r"计算器|记事本|画图|资源管理器|桌面界面|图形界面|鼠标|键盘)"
+    method = (r"(?:打开|启动|使用|通过|用|在|\buse\b|\busing\b|\bwith\b|\bvia\b|\bin\b|\bopen\b|\blaunch\b)\s*"
+              r"(?:微软\s*|Microsoft\s*)?(?:Excel|Word(?![a-z0-9_])|PowerPoint|Notepad|Paint|Explorer|Calculator|"
+              r"GUI(?![a-z0-9_])|计算器|记事本|画图|资源管理器|桌面界面|图形界面|鼠标|键盘)"
+              r"|(?:只|仅|全程|必须)\s*(?:走|用|操作)?\s*(?:GUI(?![a-z0-9_])|图形界面|桌面界面|纯视觉)"
               r"|(?:在|使用|通过)[^，。；;\n]{1,32}(?:应用中|软件中|客户端中|窗口中|的界面)"
               r"|(?:操作|使用|用|\busing\s+|\buse\s+)\s*(?!(?:CLI|PowerShell|shell|terminal)\b)(?-i:[A-Z])[a-zA-Z0-9.-]+")
     if not re.search(method, task, re.I):

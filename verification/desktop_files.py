@@ -2,6 +2,7 @@
 import base64
 import inspect
 import json
+import ntpath
 import os
 import re
 
@@ -9,6 +10,67 @@ from ..runtime.cli_executor import cli_capability
 
 
 FILE_PREDICATES = frozenset({'file_exists', 'file_absent', 'file_content', 'files_equal'})
+
+
+def named_docx_creation(task):
+    """Recognize a single named creation, before the planner or any write.
+
+    Only whole instructions with an unambiguous destination are inferred.
+    Additional business requirements continue through the semantic review.
+    """
+    sentence = task.strip().rstrip('。.!！').strip()
+    restriction = re.search(r'[,，;；]\s*(?:禁止|不要|不得|不使用)\s*(?:使用\s*)?'
+                            r'(?:后台(?:操作|写入)?|命令行|CLI|PowerShell)\s*$', sentence, re.I)
+    if restriction:
+        sentence = sentence[:restriction.start()].rstrip()
+    method = re.match(r'^(?:请\s*)?(?:使用|通过|用)\s*(?:Microsoft\s*)?'
+                      r'(?:Word|资源管理器|图形界面|桌面界面)\s*[,，]?\s*', sentence, re.I)
+    if method:
+        sentence = sentence[method.end():]
+    sentence = re.sub(r'^(?:请\s*|please\s+)', '', sentence, flags=re.I)
+    # A filename or an explicitly rooted path. Reserved filename characters
+    # also delimit the quoted folder/name form in natural-language tasks.
+    filename = r'[\w .()（）-]+?'
+    folder = r'(?P<folder>(?:[A-Za-z]:[\\/]|\\\\)[^<>:"|?*，。\n]*?)'
+    match = re.fullmatch(
+        r'在\s*["“]?' + folder + r'["”]?\s*(?:目录|文件夹)?(?:下|中)?\s*(?:新建|创建)\s*'
+        r'(?:一个|一份)?\s*(?:名为|名叫|叫做|叫)?\s*["“]?(?P<name>' + filename
+        + r')["”]?\s*(?:的\s*(?:Word\s*)?文档|(?<=\.docx))', sentence, re.I)
+    additional_steps = False
+    if match:
+        name = match['name'].strip()
+        extension = ntpath.splitext(name)[1]
+        if not name or (extension and extension.lower() != '.docx'):
+            return None
+        target = ntpath.join(match['folder'].strip(), name if extension else name + '.docx')
+    else:
+        match = re.fullmatch(r'(?:新建|创建|create\s+)(?:一个|一份|a\s+new\s+|a\s+)?\s*'
+                             r'(?:(?:Word\s*文档|Word\s+document(?:\s+named)?)\s*)?'
+                             r'["“]?(?P<path>(?:[A-Za-z]:[\\/]|\\\\)[^<>:"|?*，。\n]*?\.docx|'
+                             + filename + r'\.docx)["”]?', sentence, re.I)
+        if match:
+            target = match['path'].strip()
+        else:
+            # A compound task can still have a clearly stated durable output.
+            # Infer only the file condition and keep the whole task for review.
+            if len(re.findall(r'\.docx(?![a-z0-9_])', sentence, re.I)) != 1:
+                return None
+            creation = re.match(r'(?:新建|创建|create\b)', sentence, re.I)
+            if not creation:
+                return None
+            destination = re.search(r'(?:^|\bcreate\s+|新建|创建|另存为|保存为|save\s+(?:it\s+)?as\s+)'
+                                    r"""\s*["“']?(?P<path>[A-Za-z]:[\\/][^<>:"|?*，。,\n]*?\.docx)"""
+                                    r'(?=$|[^A-Za-z0-9_.-])', sentence, re.I)
+            if not destination:
+                return None
+            target = destination['path'].strip()
+            additional_steps = True
+    if target.lower().count('.docx') != 1:
+        return None
+    checks = [{'kind': 'desktop_file', 'path': target, 'format': 'docx', 'change': 'created'}]
+    if method or restriction or additional_steps:
+        checks.append({'kind': 'unresolved_requirement', 'text': task.strip()})
+    return {'checks': checks}
 
 
 def normalize_desktop_file(check):

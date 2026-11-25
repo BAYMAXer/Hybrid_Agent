@@ -189,3 +189,16 @@ pwsh -NoProfile -File (Join-Path $RepoRoot 'scripts\install-hcu-windows.ps1') -S
 | 文件成功但桌面定位失败 | 查看合成图的返回点和置信度，确认适配器与公司模型的坐标协议一致。若只有原生定位适配器返回 401，检查第 3 节的密钥解析 |
 
 交接回报保留部署提交号、Python 版本、各角色的模型 ID 和适配器类型、Studio 地址、CLI 与桌面轨迹目录、合成图返回坐标，以及 Jev 的实测结果或「未启用」。只有在目标机实际发起公司请求并核对产物后，才记录该项通过。凭据不写入文档、轨迹备注或 Git。
+
+## 8. 双屏选择与公司环境复验
+
+在 Studio 选择「本机任务 → Windows 通用桌面 → 任务屏幕」。初始选项为 Windows 主屏，选项会显示设备标识和物理分辨率。单任务和批量任务都在下发时绑定具体设备。命令行可传 `--desktop-monitor primary` 或设备 ID；Studio 运行期间执行以下命令可查看本机可用的标识。
+
+```powershell
+(Invoke-RestMethod 'http://127.0.0.1:8090/runtime/info').desktop_monitors |
+    Format-Table id, name, width, height, primary
+```
+
+1. 在目标电脑上分别建立两个空测试目录。设为公司模型、选「纯视觉桌面验证」、取消 Terra。第一轮要求“通过资源管理器和 Word 在第一个目录新建 test.docx，禁止后台或 CLI”；第二轮只要求在第二个目录新建同名 Word 文档，允许计划选择 CLI。把实际绝对路径写入每轮任务。正式验收可像第 4 节一样传 `--completion-spec`，将 `desktop_file` 的 `format` 改为 `docx`，保留 `change=created`，删除该节示例中无关的文本要求。确认目标文件可由 Word 打开、轨迹验收成功，并核对第一轮全程没有后台写入。
+2. 在副屏打开任务明确指定的文档，同一应用另开一份无关文档。下发指定任务屏的 GUI 任务，检查目标及其已确认的保存对话框位于任务屏、无关文档仍在原位。对照 `trajectory.json` 的 `run_manifest.desktop_monitor`、`desktop_monitor_info` 及逐步截图尺寸。若设备被拔出，检查事件里记录的停止原因。导航回放中，单击选中文件夹不能证明进入目录，核对 `steps[].step_progress` 是否在活动视图确证目标路径后出现进展。
+3. 对比旧版合屏与新版单屏时，分别用两个检出目录，在**同一台双屏电脑**固定 Windows 布局、任务屏、公司模型版本、历史帧配置和任务指令；两组使用各自的全新输出目录。每版至少复测三轮，记录截图尺寸、每次请求的图片数、服务实际返回的输入 token、决策耗时和总耗时中位数。回放旧轨迹中的记录可作旁证；模型未上报 token 时填「未上报」。另记成功率和实际步数，避免把少走操作步骤带来的差异归入单次推理耗时。

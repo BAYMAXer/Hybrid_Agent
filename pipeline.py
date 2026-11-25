@@ -1779,7 +1779,9 @@ class Pipeline:
                    step_progress=state.step_progress,
                    remaining_decisions=self.max_steps - step_no)
         repaired = False
-        if self._replans < self.max_replans and self._task_time_remaining() > 0:
+        attempted = self._replans < self.max_replans and self._task_time_remaining() > 0
+        call_offset = len(self.planning_calls)
+        if attempted:
             self._replans += 1
             repaired = self._plan(state.task, state, repair=True)
         if repaired:
@@ -1787,10 +1789,20 @@ class Pipeline:
             self._clear_stall(state)
             state.memory.control_state = "RECOVER"
             state.memory.add_event("已根据实际失败证据重新规划；继续使用当前环境，不重置任务。")
+            status, reason = 'replanned', ''
         else:
-            result.trajectory.append({"step": step_no, "early_stop": "持续失败且恢复预算耗尽"})
-            result.termination_reason = "task_timeout" if self._task_time_remaining() <= 0 else "stalled"
-        self._publish_diagnostic("framework_recovery", status="replanned" if repaired else "exhausted",
+            if self._task_time_remaining() <= 0:
+                status, reason = 'task_timeout', '任务总时限已到'
+            elif attempted:
+                status = 'proposal_rejected'
+                reason = next((c['validation_error'] for c in reversed(self.planning_calls[call_offset:])
+                               if c.get('validation_error')), '规划服务未能生成有效的恢复方案')
+            else:
+                status, reason = 'exhausted', '持续失败且恢复预算耗尽'
+            result.termination_reason = 'task_timeout' if status == 'task_timeout' else 'stalled'
+            result.final_answer = f'任务停滞，恢复方案未通过：{reason}' if status == 'proposal_rejected' else reason
+            result.trajectory.append({"step": step_no, "early_stop": result.final_answer, "recovery_status": status})
+        self._publish_diagnostic("framework_recovery", status=status, reason=reason,
                    remaining_replans=max(0, self.max_replans - self._replans))
         return not repaired
 
@@ -1945,7 +1957,9 @@ class Pipeline:
             state.progress_monitor = StepProgressMonitor(self.progress_config)
         report = state.step_review if review is None else review
         step = next((s for s in state.queue.plan['steps'] if s['id'] == report.get('plan_step_id')), state.queue.current)
-        state.step_progress = state.progress_monitor.observe(step, report, before, state.obs, action, info, collected_sources=state.report_sources)
+        state.step_progress = state.progress_monitor.observe(
+            step, report, before, state.obs, action, info, collected_sources=state.report_sources,
+            task=state.task, public_checks=self.completion.public_spec.get('checks', ()))
         self._publish_diagnostic('step_progress', report=state.step_progress)
         if state.step_progress['status'] == 'stalled':
             state.failure_class = 'step_no_progress'

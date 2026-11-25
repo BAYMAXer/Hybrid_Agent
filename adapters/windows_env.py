@@ -279,9 +279,8 @@ class WindowsEnvironment(Environment):
     def _build_observation(self) -> Observation:
         """Collect screenshot and AX on one page, with an explicit coordinate space.
 
-        浏览器模式（后台独立浏览器）只取 CDP 截图，绝不回退到截取用户整屏；
-        虚拟桌面截图仅用于显式 observe_desktop。这样即使用户把浏览器窗口挡在后面，
-        截图仍是该浏览器页面的完整内容，不受遮挡/前台影响。
+        Windows 通用桌面使用本轮固定的任务屏。后台浏览器观察通过 CDP 截取页面，
+        不受浏览器窗口遮挡影响；只有显式 observe_desktop 才观察整个虚拟桌面。
         """
         from ..model.grounding import screenshot_size
         from ..runtime.scene import Scene, browser_scene
@@ -355,7 +354,7 @@ class WindowsEnvironment(Environment):
                     info[key] = metadata[key]
             context = [snapshot] if snapshot else []
         else:
-            # 桌面模式：显式 observe_desktop 才截取全部显示器。
+            # 本机桌面截任务屏，浏览器任务显式切到桌面时沿用虚拟桌面截图。
             try:
                 screenshot = self._take_screenshot()
             except (ValueError, OSError, RuntimeError) as exc:
@@ -416,6 +415,12 @@ class WindowsEnvironment(Environment):
                 info['desktop_focus_stable'] = bool(info['desktop_focus_stable'] and before.get("title") == after.get("title"))
                 if self._task_monitor:
                     info['desktop_focus_stable'] = bool(info['desktop_focus_stable'] and before.get('bounds') == after.get('bounds'))
+                if (info['desktop_focus_stable'] and info.get('desktop_capture_id')
+                        and not info.get('desktop_foreground_outside_task_monitor') and not info.get('observation_error')):
+                    from ..desktop.explorer_location import observe_explorer_location
+                    location = observe_explorer_location(after)
+                    if location is not None:
+                        info['explorer_location'] = location
                 kind, confirmation_text = common_file_dialog(after, ax_block if info['desktop_focus_stable'] else None)
                 info["desktop_file_dialog"] = kind == "picker"
                 info["desktop_overwrite_protected"] = kind == "overwrite" and self._overwrite_protected(confirmation_text)

@@ -19,8 +19,24 @@ def recovery_brief(state):
     def step_brief(step):
         return {k: copy.deepcopy(step[k]) for k in ('goal', 'phase', 'actions', 'expected_evidence') if k in step}
     review = {k: state.step_review[k] for k in ('status', 'reason', 'method', 'evidence') if k in state.step_review}
+    info = getattr(getattr(state, 'obs', None), 'info', {}) or {}
+    desktop = {}
+    if info.get('task_mode') == 'desktop':
+        from ..desktop.explorer_location import committed_explorer_path
+        location = committed_explorer_path(state.obs)
+        if location:
+            desktop['explorer_directory'] = location
+        missing = []
+        for sample in info.get('cli_checks', []):
+            predicate = sample.get('predicate') or {}
+            result = sample.get('result') or {}
+            if (predicate.get('kind') == 'file_exists' and result.get('status') == 'executed'
+                    and (result.get('file') or {}).get('exists') is False):
+                missing.append(predicate['path'])
+        desktop['missing_files'] = missing
     from ..reporting.report_delivery import observed_navigation_hints
-    return {'observed_navigation_hints': observed_navigation_hints(state), 'failure_class': getattr(state, 'failure_class', ''), 'failure_key': getattr(state, 'failure_key', ''),
+    return {**({'desktop_state': desktop} if desktop else {}),
+            'observed_navigation_hints': observed_navigation_hints(state), 'failure_class': getattr(state, 'failure_class', ''), 'failure_key': getattr(state, 'failure_key', ''),
             'blocked_step': step_brief(queue.current) if queue and queue.current else None,
             'completed_steps': [s.get('goal') for s in steps[:cursor]],
             'remaining_steps': [step_brief(s) for s in steps[cursor:]],

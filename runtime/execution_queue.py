@@ -19,8 +19,8 @@ def normalize_verification(value):
         return [{"kind": "visual"}]
     if not isinstance(value, list) or not 1 <= len(value) <= 8:
         raise ValueError("verification 必须含 1~8 项核查条件")
-    allowed = {"files_equal", "file_exists", "file_absent", "file_content", "visual", "url_equals", "url_host", "text_present", "app_open", "app_foreground", "app_ready", "element_state", "download_complete", "download_valid", "artifact_download"}
-    required = {"files_equal": "path", "file_exists": "path", "file_absent": "path", "file_content": "path", "url_equals": "url", "url_host": "host", "text_present": "text", "app_open": "app", "app_foreground": "app", "app_ready": "app", "element_state": "name", "download_complete": "check_id", "download_valid": "check_id"}
+    allowed = {"files_equal", "file_exists", "file_absent", "file_content", "explorer_folder_equals", "visual", "url_equals", "url_host", "text_present", "app_open", "app_foreground", "app_ready", "element_state", "download_complete", "download_valid", "artifact_download"}
+    required = {"files_equal": "path", "file_exists": "path", "file_absent": "path", "file_content": "path", "explorer_folder_equals": "path", "url_equals": "url", "url_host": "host", "text_present": "text", "app_open": "app", "app_foreground": "app", "app_ready": "app", "element_state": "name", "download_complete": "check_id", "download_valid": "check_id"}
     result = []
     for item in value:
         if not isinstance(item, dict) or item.get("kind") not in allowed:
@@ -49,6 +49,10 @@ def normalize_verification(value):
             clean["scope"] = item["scope"]
         if key:
             clean[key] = item[key].strip()
+        if kind == 'explorer_folder_equals':
+            from ..desktop.explorer_location import filesystem_path
+            if not filesystem_path(clean['path']):
+                raise ValueError('explorer_folder_equals.path 需要绝对的 Windows 文件系统目录')
         if kind == "url_equals" and urlsplit(clean["url"]).scheme not in {"https", "http"}:
             raise ValueError("url_equals 需要完整 http(s) URL")
         if kind == "url_host" and ("/" in clean["host"] or ":" in clean["host"] or " " in clean["host"]):

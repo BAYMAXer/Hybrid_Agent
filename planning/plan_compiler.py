@@ -20,14 +20,23 @@ from ..runtime.execution_queue import (
 from .task_specs import audit_requirement_proposals
 
 
-def normalize_plan_actions(names):
+def normalize_plan_actions(names, ignored=None):
+    """Action names are planning hints. Unknown text cannot grant a tool."""
     aliases = {"open_url": "goto", "navigate": "goto", "key_press": "press", "press_key": "press",
                "input_text": "type", "type_text": "type"}
-    if isinstance(names, list):
-        names = [aliases.get(n, n) if isinstance(n, str) else n for n in names]
-    if not isinstance(names, list) or any(not isinstance(n, str) or n not in BASIC_ACTIONS for n in names):
-        raise ValueError("actions 只能包含已注册的 GUI/DOM/CLI 动作")
-    return list(dict.fromkeys(names))
+    if not isinstance(names, list):
+        if ignored is not None:
+            ignored.append(f"expected an array, got {type(names).__name__}")
+        return []
+    result = []
+    for name in names:
+        action = aliases.get(name, name) if isinstance(name, str) else None
+        if action not in BASIC_ACTIONS:
+            if ignored is not None and len(ignored) < 8:
+                ignored.append(name[:160] if isinstance(name, str) else type(name).__name__)
+        elif action not in result:
+            result.append(action)
+    return result
 
 
 def _download_recheck(goal):
@@ -63,17 +72,24 @@ def compile_plan(obj, task, public_spec, task_profile, paper_goals, *, repair=Fa
     if task_profile.get("kind") == "paper_download" and len(paper_goals) == 1:
         steps = refine_paper_plan(steps, paper_goals)
     normalized = []
+    warnings = []
     for i, step in enumerate(steps, 1):
         if not isinstance(step, dict) or not isinstance(step.get("goal"), str) or not step["goal"].strip():
             raise ValueError("每一步需要非空 goal")
         if not isinstance(step.get("expected_evidence"), str) or not step["expected_evidence"].strip():
             raise ValueError("每一步必须给出非空 expected_evidence，说明实际可以观察到的结果")
+        ignored = []
+        actions = normalize_plan_actions(step.get('actions', []), ignored)
+        if ignored:
+            warnings.append({'step': i, 'field': 'actions', 'ignored': ignored})
         ids = step.get("check_ids", [])
         if not check_ids and isinstance(ids, list):
             # Hallucinated IDs on generic tasks do not create a contract.
             ids = []
         if not isinstance(ids, list) or any(not isinstance(x, str) or x not in check_ids for x in ids):
             raise ValueError("check_ids 只能引用给定的系统验收条件；没有时用 []")
+        if (repair or not browser_workflow) and not ids and step.get('verification') is None:
+            raise ValueError(f"第 {i} 个子目标缺少 verification；视觉核查请显式填写 visual 条件")
         try:
             proposed = step.get('verification')
             if isinstance(proposed, list):
@@ -128,7 +144,7 @@ def compile_plan(obj, task, public_spec, task_profile, paper_goals, *, repair=Fa
                     renamed = bool(filename and re.search(r'(?:改名|重命名|命名|另存|rename).{0,10}' + re.escape(filename.rsplit('.', 1)[0]), task, re.I))
                     if (isinstance(predicate, dict) and predicate.get('kind') == 'file_exists'
                             and str(step.get('phase', '')) in {'download', 'verify', 'final', 'inspect_download'}
-                            and 'cli' not in step.get('actions', []) and filename and filename not in task and not renamed):
+                            and 'cli' not in actions and filename and filename not in task and not renamed):
                         replacement = {'kind': 'artifact_download', 'format': 'pdf' if re.search(r'pdf|论文', task, re.I) else 'any'}
                         if _download_recheck(step['goal']):
                             replacement['purpose'] = 'recheck'
@@ -146,7 +162,7 @@ def compile_plan(obj, task, public_spec, task_profile, paper_goals, *, repair=Fa
             if predicate['kind'] in {'download_complete', 'download_valid'} and predicate['check_id'] not in check_ids:
                 raise ValueError('下载谓词 check_id 必须引用已有系统条件')
         phase = str(step.get('phase') or '')
-        if phase == 'report' and ('cli' in step.get('actions', []) or any(
+        if phase == 'report' and ('cli' in actions or any(
                 p.get('kind') in {'app_open', 'file_exists', 'file_content', 'files_equal', 'file_absent'}
                 for p in verification)):
             # Reporting is framework-generated; a combined operational step
@@ -156,7 +172,7 @@ def compile_plan(obj, task, public_spec, task_profile, paper_goals, *, repair=Fa
                            "expected_evidence": str(step.get("expected_evidence") or ""),
                            "check_ids": ids, "phase": phase, "status": "pending",
                            "verification": verification,
-                           "actions": normalize_plan_actions(step.get("actions", []))})
+                           "actions": actions})
     if task_profile.get("kind") == "paper_download":
         phases = {step["phase"] for step in normalized}
         allowed = {phase["phase"] for phase in task_profile["workflow"]}
@@ -175,7 +191,7 @@ def compile_plan(obj, task, public_spec, task_profile, paper_goals, *, repair=Fa
     if browser_workflow and paper_goals:
         normalized = compile_download_milestones(normalized, paper_goals)
     paper_query = str(paper_goals[0].get('query') or paper_goals[0].get('title') or '').strip() if browser_workflow and len(paper_goals) == 1 else ''
-    return {"steps": normalized,
+    return {"steps": normalized, **({'planning_warnings': warnings} if warnings else {}),
             "requirements": audit_requirement_proposals(task, obj.get("requirements")),
             "keywords": [paper_query] if paper_query else obj.get("keywords") if isinstance(obj.get("keywords"), list) else [],
             "final_check": ('框架确认目标论文 PDF 已保存到默认工程目录且内容身份匹配' if paper_query

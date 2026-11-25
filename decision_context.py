@@ -166,6 +166,7 @@ def system_sections(names, obs, os_name="linux", *, profile=None, task="", step=
                 text += "返回网页结构操作先observe_browser。\n"
             if os_name.lower() == "windows":
                 text += 'Windows：资源管理器未打开时hotkey keys=["win","e"]；复制/全选使用ctrl。\n'
+                text += '资源管理器就绪且已知目标绝对目录时，优先 Ctrl+L、输入完整路径、Enter，再核对活动目录。左侧导航项可单击，主区的文件夹图标通常双击打开。\n'
             elif os_name.lower() in {"mac", "macos", "darwin"}:
                 text += "macOS：文件管理器是Finder，复制/全选/地址栏等使用command。\n"
             text += "另存/找文件/改名优先直接打开默认工程目录；原任务指定其他路径时遵循原任务。\n"
@@ -412,6 +413,13 @@ def current_brief(state, public_checks=(), operation_facts=(), *, knowledge=None
     if step and step.get('expected_evidence'):
         lines.append('本步骤预期：' + short_text(step['expected_evidence'], 400))
     lines.extend(navigation_brief(getattr(state, 'task', ''), step, knowledge))
+    from .desktop.explorer_location import committed_explorer_path
+    folder = committed_explorer_path(getattr(state, 'obs', None))
+    if folder:
+        lines.append('资源管理器当前活动目录（Windows Shell 实读）：' + folder)
+    nav_feedback = (getattr(state, 'step_progress', None) or {}).get('navigation_feedback')
+    if nav_feedback:
+        lines.append(nav_feedback)
     lines.append('本次系统时间：' + datetime.now().astimezone().isoformat(timespec='seconds') + '；网页发布日期不等于查询日期。')
     from .reporting.report_delivery import observed_navigation_hints
     hints = observed_navigation_hints(state)

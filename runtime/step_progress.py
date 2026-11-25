@@ -6,6 +6,12 @@ recovery signal, never a completion verdict or training reward.
 """
 from dataclasses import dataclass
 import json
+import ntpath
+import re
+
+from ..desktop.desktop_readiness import launch_target
+from ..desktop.desktop_state import windows_application_process
+from ..desktop.explorer_location import committed_explorer_path, filesystem_path, ready_explorer
 
 
 @dataclass(frozen=True)
@@ -43,6 +49,31 @@ def _controls(obs):
     return result
 
 
+def _task_names_path(task, path):
+    # Allow adjacent Chinese instructions ("D:\\Download创建..."), without
+    # treating a common prefix ("D:\\Down", "D:\\Download42") as a match.
+    boundary = r"""(?=$|[\s"'“”‘’，。；、,;!?()（）]|[.](?:\s|$)|(?:目录|文件夹)?(?:中|下|内)?(?:创建|新建|保存|打开|输入|并|复制|移动))"""
+    return bool(path and re.search(re.escape(path) + boundary, (task or '').replace('/', '\\'), re.I))
+
+
+def _is_target_folder(folder, task, public_checks, step):
+    if not folder:
+        return False
+    if _task_names_path(task, folder):
+        return True
+    for checks, trusted in ((public_checks, True), ((step or {}).get('verification', ()), False)):
+        for check in checks or ():
+            kind = check.get('kind')
+            if kind not in {'desktop_file', 'file_exists', 'file_absent', 'file_content', 'files_equal', 'explorer_folder_equals'}:
+                continue
+            for field in ('path', 'other_path'):
+                path = filesystem_path(check.get(field))
+                directory = path if kind == 'explorer_folder_equals' or check.get('file_type') == 'directory' else ntpath.dirname(path)
+                if ntpath.normcase(directory) == ntpath.normcase(folder) and (trusted or _task_names_path(task, path)):
+                    return True
+    return False
+
+
 class StepProgressMonitor:
     def __init__(self, config=None):
         self.config = config or ProgressConfig()
@@ -59,7 +90,36 @@ class StepProgressMonitor:
         self.seen.add(key)
         return True
 
-    def observe(self, step, review, before, after, action, info, *, collected_sources=()):
+    def _explorer_progress(self, before, after, action, task, public_checks, step, evidence):
+        new_window = ready_explorer(after)
+        if not action or not new_window or action.action in {'wait', 'observe_desktop'}:
+            return ''
+        old_window = ready_explorer(before)
+        opening = launch_target(action) or (action.action == 'switch_applications'
+                                             and windows_application_process(action.args.get('app_code')) == 'explorer')
+        if (opening and not old_window and self.explorations < self.config.exploration_allowance
+                and self._fresh(['explorer_ready'])):
+            self.explorations += 1
+            evidence.append('资源管理器首次在前台就绪，可开始导航（有界探索宽限）')
+        old_folder, folder = committed_explorer_path(before), committed_explorer_path(after)
+        changed = ntpath.normcase(old_folder) != ntpath.normcase(folder)
+        if _is_target_folder(folder, task, public_checks, step):
+            if changed and self._fresh(['explorer_folder', ntpath.normcase(folder)]):
+                evidence.append('资源管理器活动视图已进入任务指定目录：' + folder)
+            # Once there, choosing "New" or a menu item can legitimately advance
+            # the task without any further directory transition.
+            return ''
+        if action.action != 'click' or changed or not old_window or old_window['hwnd'] != new_window['hwnd']:
+            return ''
+        target = str(action.args.get('target') or '').strip()
+        folder_item = (re.search(r'导航栏|导航窗格|驱动器|文件夹图标|\([a-z]:\)|folder icon|navigation pane', target, re.I)
+                       or bool(target and ('\\' + target.casefold()) in (task or '').casefold().replace('/', '\\')))
+        if not folder_item:
+            return ''
+        feedback = f'单击后目录未切换，当前仍为 {folder}。' if folder else '单击后尚未核实目录切换。'
+        return feedback + '要进入主区的文件夹可双击；已知绝对路径可在地址栏输入并按 Enter。'
+
+    def observe(self, step, review, before, after, action, info, *, collected_sources=(), task='', public_checks=()):
         step_id = review.get('plan_step_id') or (step or {}).get('id', 'final')
         if step_id != self.step_id:
             self.step_id = step_id
@@ -67,12 +127,16 @@ class StepProgressMonitor:
             self.seen.clear()
             self.attempts.clear()
             self._fresh(['url', _url(before)])
+            self._fresh(['explorer_folder', ntpath.normcase(committed_explorer_path(before))])
+            if ready_explorer(before):
+                self._fresh(['explorer_ready'])
             for key, value in _controls(before).items():
                 self._fresh(['control', key, value])
             for artifact in (getattr(before, 'info', None) or {}).get('artifacts', []):
                 if artifact.get('completed') is True:
                     self._fresh(['artifact', artifact.get('artifact_id') or artifact.get('download_id') or artifact.get('path')])
         status, evidence = 'watching', []
+        navigation_feedback = ''
         pending = (info.get('pending_downloads') or (getattr(after, 'info', None) or {}).get('pending_downloads')
                    or info.get('status') in {'pending', 'in_progress'})
         if pending:
@@ -90,12 +154,17 @@ class StepProgressMonitor:
             for index, check in enumerate(review.get('code_checks', review.get('checks', []))):
                 if check.get('status') == 'passed' and self._fresh(['check', index, check.get('kind'), check.get('id')]):
                     evidence.append('当前步骤的一个代码检查项已满足')
-            successful = not info.get('error_code') and info.get('status') == 'executed'
+            moved = (getattr(after, 'info', None) or {}).get('desktop_window_moved')
+            successful = not moved and not info.get('error_code') and info.get('status') == 'executed'
             if successful:
+                if info.get('dispatched') is not False:
+                    navigation_feedback = self._explorer_progress(before, after, action, task, public_checks, step, evidence)
                 old_controls = _controls(before)
                 if name in {'type', 'press', 'hotkey', 'select', 'click'}:
                     for key, value in _controls(after).items():
                         if value is None or key not in old_controls or old_controls[key] is None or value == old_controls[key]:
+                            continue
+                        if navigation_feedback and value.get('selected') != old_controls[key].get('selected'):
                             continue
                         if name == 'type' and str(args.get('text', '')) not in str(value.get('value') or ''):
                             continue
@@ -133,7 +202,7 @@ class StepProgressMonitor:
                     evidence.append('已保存新的网页正文证据，且独立核查确认采集有进展；尚未判定完成')
             effect = review.get('action_effect', {})
             fingerprint = effect.get('evidence_fingerprint')
-            if (successful and effect.get('method') == 'decision_model' and effect.get('status') == 'passed'
+            if (successful and not navigation_feedback and effect.get('method') == 'decision_model' and effect.get('status') == 'passed'
                     and fingerprint and self.explorations < self.config.exploration_allowance
                     and self._fresh(['judge_effect', fingerprint])):
                 self.explorations += 1
@@ -147,6 +216,7 @@ class StepProgressMonitor:
                   'watching': '已观察到进展' if evidence else '尚未观察到当前子任务的新进展'}[status]
         return {'plan_step_id': step_id, 'goal': (step or {}).get('goal', review.get('goal', '')),
                 'status': status, 'reason': reason, 'evidence': evidence,
+                **({'navigation_feedback': navigation_feedback} if navigation_feedback else {}),
                 'idle_decisions': self.idle, 'step_decisions': self.decisions,
                 'limit': self.config.no_progress_limit, 'recent_attempts': list(self.attempts),
                 'source': 'framework_progress_monitor', 'policy_trainable': False}

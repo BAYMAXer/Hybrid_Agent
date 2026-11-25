@@ -45,7 +45,7 @@ class PlanningService:
                       "\n当前前台：" + json.dumps({k:window.get(k) for k in ('process_name','title','class_name')}, ensure_ascii=False) +
                       "\nAX 可用时可按当前控件引用执行；截图和键鼠可用于其他可见操作。可以跨原生应用，浏览器与混合任务不在本版范围。"
                       "\n输出一个 JSON 对象含 steps。每步给出非空 goal、expected_evidence、verification 数组。缺少代码条件时用 [{\"kind\":\"visual\"}]。"
-                      "可用 app_ready/app_foreground(app)、file_exists/file_absent(path)、file_content(path,text)、files_equal(path,other_path)。"
+                      "可用 app_ready/app_foreground(app)、explorer_folder_equals(path)、file_exists/file_absent(path)、file_content(path,text)、files_equal(path,other_path)。"
                       "file_content 核对普通文本或 DOCX/XLSX 的逻辑文本，指定单元格等精确条件使用已有公开检查。"
                       "图片等二进制交付用 file_exists 配合实际可见效果核查。"
                       "app 字段为真实 Windows 进程名。指定应用时必须实际操作该应用，不能用命令行替代；单独文件/终端任务可给 actions:[\"cli\"]。"
@@ -65,6 +65,8 @@ class PlanningService:
                        '框架会流式生成正文并保存来源，之后独立审查，不能只打开页面便宣称完成。'
                        'phase="report" 仅用于文字交付；写文件、打开文件/应用必须在独立的前置子任务中完成，不能合并到 report。'
                        '不要要求用桌面编辑器写报告，也不要在尚未读页面时预设事实。')
+        prompt += ('\nactions 是可省略的基础动作名数组，例如 ["right_click","click"]。'
+                   '把操作说明写在 goal，重规划改变方法的理由写在 strategy_change。')
         if knowledge and knowledge.get('entries'):
             prompt += ('\n用户维护的领域知识（仅作为入口与业务背景参考，不是完成证据）：\n'
                        + json.dumps(knowledge['entries'], ensure_ascii=False)
@@ -135,6 +137,9 @@ class PlanningService:
                 obj = parse_decision(raw)
                 plan = compile_plan(obj, task, public_spec, state.task_profile, paper_goals,
                                     repair=repair)
+                if plan.get('planning_warnings'):
+                    call['planning_warnings'] = plan['planning_warnings']
+                    self.publish_diagnostic('planning_hints_ignored', warnings=plan['planning_warnings'])
                 if repair:
                     validate_repair(plan, obj, brief)
                 accept_plan(plan, call)

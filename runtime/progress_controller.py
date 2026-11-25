@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from ..env import Observation
+from ..desktop.explorer_location import committed_explorer_path
 from ..verification.judge_evidence import desktop_blocks, visible_native_node
 from .pipeline_types import Decision, Execution, StepState
 
@@ -72,6 +73,8 @@ def _semantic_observation(obs):
     observed = [{"kind": block.get("kind"), "url": block.get("url"),
                  "nodes": [{k: node[k] for k in fields if k in node} for node in block.get("nodes", [])]}
                 for block in obs.context if block.get("kind") == "browser_ax"]
+    if folder := committed_explorer_path(obs):
+        observed.append({'kind': 'explorer_folder', 'path': folder.casefold()})
     for block in desktop_blocks(obs):
         # HCU refs are leases for input, not durable identities for review.
         observed.append({"kind": "desktop_ax", "window": {k: block[k] for k in ("app", "pid", "title") if k in block},
