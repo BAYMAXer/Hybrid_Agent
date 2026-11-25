@@ -57,6 +57,12 @@ def test_guest_uses_only_guest_capabilities(target_os, dialect):
         assert f'"shell": "{dialect}"' in system
 
 
+def test_studio_can_render_cli_template_before_any_observation():
+    from hybrid_agent.prompts import build_editable_mode_prompts, build_mode_system_prompts
+    for render in (build_editable_mode_prompts, build_mode_system_prompts):
+        assert 'cli' in render('windows', browser_only=True)
+
+
 def test_required_desktop_method_does_not_offer_shell(tmp_path):
     env = SimpleNamespace(cli_target='local', os_name='windows', initial_state={'workspace_dir': str(tmp_path)})
     obs = Observation(screenshot=Image.new('RGB', (40, 40)), info={'task_mode':'desktop', 'active_surface':'desktop'})

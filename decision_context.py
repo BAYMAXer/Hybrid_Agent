@@ -196,7 +196,7 @@ def system_sections(names, obs, os_name="linux", *, profile=None, task="", step=
     if 'cli' in names and not any(k == 'cli_environment' for k, _ in sections):
         sections.append(('cli_environment', 'CLI目标环境：' + json.dumps((getattr(obs, 'info', None) or {}).get('cli_capability', {}), ensure_ascii=False)))
     if profile.mode == 'cli' and 'cli' in names:
-        cap = obs.info.get('cli_capability') or {}
+        cap = (getattr(obs, 'info', None) or {}).get('cli_capability') or {}
         guidance = []
         if cap.get('shell') == 'cmd.exe':
             guidance.append('shell.command 按 cmd.exe /d /s /c 解析。PowerShell 语句须显式调用 powershell.exe -NoProfile -Command "..." 或 powershell.exe -NoProfile -File "脚本.ps1"。')
