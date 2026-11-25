@@ -8,6 +8,8 @@ git clone https://github.com/BAYMAXer/Hybrid_Agent.git hybrid_agent
 
 以下 `python -m hybrid_agent.…` 命令从 `hybrid_agent` 的父目录执行。Windows 和 macOS 的安装命令见[连接远程模型运行](#连接远程模型运行)，Linux MiniWoB++ 的安装和评测见[运行指南](docs/miniwob-linux.md)。
 
+在另一台 Windows 电脑上使用公司模型服务时，请按[部署与模型接口交接文档](docs/windows-company-deployment.md)配置 Studio、替换模型，并分别验收文件任务、视觉定位和桌面轨迹。
+
 ## 目录结构
 
 | 位置 | 内容 |
